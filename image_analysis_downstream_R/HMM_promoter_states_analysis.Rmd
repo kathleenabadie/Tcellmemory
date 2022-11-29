@@ -1,0 +1,2525 @@
+---
+title: "HMM_promoter_states"
+author: "Kathleen Abadie"
+output: html_document
+---
+
+# Load libraries
+```{r}
+library(R.matlab)
+library(tidyr)
+library(dplyr)
+library(purrr)
+library(fitdistrplus)
+library(stringr)
+library(reshape2)
+library(tibble)
+library(umap)
+library(irlba)
+library(cowplot)
+library(RColorBrewer)
+
+library(msm)
+
+library(ggplot2)
+library(gridExtra)
+library(reshape2)
+library(ggpubr)
+
+rm(list = ls())
+```
+
+## Functions
+```{r}
+
+##############################################################################################################################################
+# read_trlong reads all fluor data fields from trlong.mat files stores them in a dataframe for each leaf of each lin in the trlong.mat file. Additionally, it stores the track number the corresponds to every cell and a logical indicating whether or not a given row corresponds to the end of a track (e.g. cell division or end of lineage)
+
+read_trlong <- function(filename, field_names){
+  
+  # read trlong file using R.Matlab readMat
+  trlong_file <- readMat(filename)
+  
+  # initialize list that will be a list of lineages (e.g. if there are two lins, this list will have two elements)
+  tibble_list_all_i <- list()
+  
+  # loop through lins (i)
+  for (i in seq(from = 1, to = length(trlong_file$lin))) {
+    lin <- trlong_file$lin[[i]]
+    tibble_list_all_j <- list()
+    
+    # loop through longtracks within each lin (j). These are the leaves of each lineage
+    for (j in seq(from =1, to = dim(lin)[3])) {
+      # first check if this leaf has more than 2 time point (which means at least one time point with a derivative). if not, break
+      if (length(trlong_file$lin[[i]][,,j]$t) < 3){
+        tibble_list_all_j[[j]] <- NA
+        break
+      }
+      # next check if there are the correct number of field names for this track, if not, break
+      else if (length(trlong_file$lin[[i]][,,j]) != 11) {
+        tibble_list_all_j[[j]] <- NA
+        break      
+      }
+      # initialize df with which to fill the main df at index i, j. this df will contain all data fields
+      nrow <- length(trlong_file$lin[[i]][,,j]$t) # in the future, generalize this to make it the max length of all fields, but for now       hard coding as length of t vector
+      ncol <- length(field_names)
+      tibble_ij <- as_tibble(matrix(nrow = nrow, ncol = ncol)) # nrow is number of time points, ncol is number of fields
+      colnames(tibble_ij) <- field_names
+      # for each field, make a vector that will become a column of the tibble
+      for (f in seq(from=1, to=length(field_names))) {
+        # add NA where necessary if field has less or more elements than the t vector (from which the number of rows in this df is set)
+        if ((length(trlong_file$lin[[i]][,,j][[field_names[f]]])) < nrow) {
+          trlong_file$lin[[i]][,,j][[field_names[f]]][length(trlong_file$lin[[i]][,,j][[field_names[f]]])+1] <- NA
+          trlong_file$lin[[i]][,,j][[field_names[f]]] <- t( trlong_file$lin[[i]][,,j][[field_names[f]]])
+        }
+        else if ((length(trlong_file$lin[[i]][,,j][[field_names[f]]])) > nrow) {
+          trlong_file$lin[[i]][,,j][[field_names[f]]] <- t(trlong_file$lin[[i]][,,j][[field_names[f]]][1:nrow])
+        }
+        # add field data to tibble_ij
+        tibble_ij[field_names[f]] <- t(trlong_file$lin[[i]][,,j][[field_names[f]]])
+      }
+      
+      # get divtime for this leaf and store as single column df
+      div_df <- as.data.frame(t(trlong_file$lin[[i]][,,j][['divtime']]))
+    
+      # add divtime column to tibble_ij; this is a logical colum - all rows are false unless it is a divtime
+      tibble_ij <- tibble_ij %>% add_column(divtimes = FALSE, .after = "t")
+      tibble_ij[tibble_ij$t %in% div_df$V1,]$divtimes <- TRUE
+        
+      # get track numbers for this leaf and store as single column df
+      trs_df <- as.data.frame(t(trlong_file$lin[[i]][,,j][['tr']]))
+      # get row numbers of columns where divtime == TRUE
+      div_rows <- which(tibble_ij$divtimes)
+      # add tr_num column to tibble_ij
+      tibble_ij <- tibble_ij %>% add_column(tr_num = NA_real_, .after = "divtimes")
+      # put correct track number at corresponding divtime row
+      tibble_ij[div_rows,]$tr_num <- trs_df$V1
+      # fill in values so that every row has a corresponding track number
+      tibble_ij <- tibble_ij %>% fill(tr_num, .direction = "updown")
+      
+      
+      # store df for each leaf
+      tibble_list_all_j[[j]] <- tibble_ij # after going through all j, this should be a list of j dataframes, one for each trlong leaf
+    }
+    # store list of leaves for each lin in list of lins
+    tibble_list_all_i[[i]] <- tibble_list_all_j
+    
+  }
+  tibble_list_all_i <- lapply(tibble_list_all_i, `length<-`, max(lengths(tibble_list_all_i))) # make all elements of list same length by adding NAs to shorter ones
+  
+  # make final tibble from lin list
+  main_lin_tb <-  as_tibble(tibble_list_all_i, .name_repair = "unique")
+  
+  # return
+  return(main_lin_tb)
+}
+
+##############################################################################################################################################
+# read_trlong_trs
+read_trlong_trs <- function(filename){
+
+  # read trlong file using R.Matlab readMat
+  trlong_file <- readMat(filename)
+  
+  # initialize list that will be a list of lineages (e.g. if there are two lins, this list will have two elements)
+  tibble_list_all_i <- list()
+  
+  # loop through lins (i)
+  for (i in seq(from = 1, to = length(trlong_file$lin))) {
+    lin <- trlong_file$lin[[i]]
+      # first check if this leaf has any data. if not, break  
+    if (is_empty(trlong_file$lin[[i]][,,1]$ts)){ # if this lineage (first track) has no timepoints 
+      break
+    }
+    # for each lin, make tibble where each row designates a unique track in that lin
+    tibble_i <- as_tibble(t(trlong_file$lin[[i]][,,]))
+    tibble_i <- dplyr::select(tibble_i, -data) # we don't need the data column, so remove it
+    
+    # add position identifier column
+    f_split <- str_split(filename_list[[f]], pattern="/", simplify=T) # file name string split
+    p_split <- str_split(f_split[length(f_split)], pattern="_", simplify=T) # position string split
+    pos <- p_split[1]
+    tibble_i <- tibble_i %>% add_column(pos = pos, .before = "tr" )
+    
+    # add child_1 and child_2 column based on existing children column; existing children column gives the row numbers of the children
+    tibble_i <- tibble_i %>% add_column(child_1 = 0, .after = "children")
+    tibble_i <- tibble_i %>% add_column(child_2 = 0, .after = "child_1")
+    for (r in seq(from=1, to = dim(tibble_i)[1])){
+      tr_row <- tibble_i[r,]
+      if (!is.na(as.numeric(unlist(tr_row$children)[1]))){
+        tibble_i[r, ]$child_1 <- as.numeric(unlist(tibble_i[as.numeric(unlist(tr_row$children)[1]), ]$tr))
+      }
+      if (!is.na(as.numeric(unlist(tr_row$children)[2]))){
+        tibble_i[r, ]$child_2 <- as.numeric(unlist(tibble_i[as.numeric(unlist(tr_row$children)[2]), ]$tr))
+      }
+    }
+    ##
+    
+    tibble_list_all_i[[i]] <- tibble_i
+  }
+  
+  # make final tibble from lin list
+  main_lin_tb <-  bind_rows(tibble_list_all_i)
+  
+  return(main_lin_tb)
+}
+
+
+##############################################################################################################################################
+stack_tracks <- function(main_lin_tb){
+  
+  num_lins <- dim(main_lin_tb)[2]
+  num_tracks <- dim(main_lin_tb)[1]
+  
+  all_tracks_list <- list()
+  
+  track_count <- 0
+  for (i in seq(from = 1, to = num_lins)){
+    for (j in seq(from = 1, to = num_tracks)){
+      if (is.data.frame(main_lin_tb[[i]][[j]])){
+        track_count <- track_count + 1
+        ID <- paste((c(as.character(i), "_", as.character(j))), collapse="")
+        main_lin_tb[[i]][[j]]$lin_tr <- ID # add column to lin / track df to id the lin and track
+        all_tracks_list[[track_count]] <- main_lin_tb[[i]][[j]]
+      }
+    }
+  }
+  
+  result <- dplyr::bind_rows(all_tracks_list) %>% drop_na() # stack, dropping rows with NA
+  return(result)
+}
+
+
+##############################################################################################################################################
+# stack data from all positions, storing experimental condition and position
+stack_pos <- function(tracks_all_pos_list, filename_list){
+  
+  num_pos <- length(filename_list)
+  
+  all_pos_list <- list()
+  
+  pos_count <- 0
+  for (i in seq(from = 1, to = num_pos)){
+  
+    pos_count <- pos_count + 1
+    
+    # extract position ID and condition from filename
+    f_split <- str_split(filename_list[[i]], pattern="/", simplify=T) # file name string split
+    p_split <- str_split(f_split[length(f_split)], pattern="_", simplify=T) # position string split
+    c_split <- str_split(f_split[length(f_split)-1], pattern="_", simplify=T) # condition string split
+    pos <- p_split[1]
+    cond <- c_split[length(c_split)]
+    
+    # add info to df for each pos
+    tracks_all_pos_list[i][[1]]$cond <- cond
+    tracks_all_pos_list[i][[1]]$pos <- pos
+    tracks_all_pos_list[i][[1]]$ID <- paste(pos, tracks_all_pos_list[i][[1]]$lin_tr)
+    #tracks_all_pos_list[i][[1]] <- subset(tracks_all_pos_list[i][[1]], select = -lin_tr)# remove now redundant lin_tr column
+  }
+  
+  result <- dplyr::bind_rows(tracks_all_pos_list) %>% drop_na() # stack, dropping rows with NA
+  result <- result %>% dplyr::select(ID, cond, pos, lin_tr, everything()) # reorder columns so that ID and condition are the first columns 
+  
+  return(result)
+}
+
+##############################################################################################################################################
+# first add log 10 transform of tbet.deriv to df where all values < 0 have been set equal to 0 and a pseudocount has been added prior to log transform
+
+log_deriv <- function(df, pseudocount_tbet, pseudocount_tcf1){
+  # first, log 10 transform the data after adding a pseudocount
+  df$tbet.deriv.log10_new <- log(((df %>%
+       mutate(tbet.deriv=replace(tbet.deriv, tbet.deriv<(-1000), -1000)))$tbet.deriv +pseudocount_tbet),10)
+  # do the same for tcf1
+  df$tcf1.deriv.log10_new <- log(((df %>%
+       mutate(tcf1.deriv=replace(tcf1.deriv, tcf1.deriv<(-20000), -20000)))$tcf1.deriv +pseudocount_tcf1),10)
+  return(df)
+}
+
+##############################################################################################################################################
+plot_hists <- function(df){
+  
+  
+  # all timepoints
+  #g0<- ggplot(df, aes(x=tbet)) + geom_histogram(bins=1000) + xlim(0, 1.5e7) + ggtitle("tbet")
+  #g1<- ggplot(df, aes(x=tbet.deriv)) + geom_histogram(bins=1000) + xlim(-1e4, 1e6) + ggtitle("tbet.deriv")
+  g2<- ggplot(df, aes(x=tbet.deriv.log10_new)) + geom_histogram(binwidth=0.1)  + ggtitle("tbet.deriv.log10")
+  # ggarrange(g0, g1, g2, ncol=2, nrow=2)
+
+    # all timepoints
+  g3<- ggplot(df, aes(x=tcf1)) + geom_histogram(bins=1000)  + ggtitle("tcf1")
+  g4<- ggplot(df, aes(x=tcf1.deriv)) + geom_histogram(bins=1000) + ggtitle("tcf1.deriv")
+  g5<- ggplot(df, aes(x=tcf1.deriv.log10_new)) + geom_histogram(binwidth=0.1) + scale_x_continuous(breaks = scales::pretty_breaks(n = 20)) + xlim(2,5.5)+ ggtitle("tcf1.deriv.log10")
+  
+  
+  ggarrange(g3, g4, g5, ncol=3, nrow=1)
+}
+
+##############################################################################################################################################
+plot_overlay <- function(channel, df, t_low, t_high, data_type){
+  title <- paste(channel, ": ", as.character(t_low), "hr < t < ", t_high, " hr", sep="")
+  df<- subset(df, t>t_low & t<t_high, select= ID:tcf1.deriv.log10_new)
+  
+# if channel is tbet
+if (channel == "tbet"){ 
+    hist <- ggplot(df, aes(x=tbet.deriv.log10_new, fill= cond))  + geom_histogram(binwidth=.05, alpha=.4, position= 'identity') + xlim(3,6.5) + labs(x = "log synthesis rate") +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.line = element_line(colour = "black"), text=element_text(size=16) , legend.title=element_blank())+ ggtitle(title) +
+    scale_fill_manual(values=c("cyan3", "darkcyan")) 
+    
+      dens <- ggplot(df, aes(x=tbet.deriv.log10_new, fill= cond))  + geom_density(binwidth=.05, alpha=.4) + xlim(3,6.5) + xlab("log.tbet.deriv") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.line = element_line(colour = "black"), text=element_text(size=16) , legend.title=element_blank())+ ggtitle(title) +
+    scale_fill_manual(values=c("cyan3", "darkcyan"))
+}
+
+# if channel is tcf1
+else if (channel == "tcf1"){
+  if (data_type == "intensity"){
+     hist <- ggplot(df, aes(x=tcf1.smooth, fill= cond))  + geom_histogram(bins=1000, alpha=.4, position= 'identity') + xlab("tcf1.smooth") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.line = element_line(colour = "black"), text=element_text(size=16), legend.title=element_blank() )+ ggtitle(title)  
+    
+      dens <- ggplot(df, aes(x=tcf1.smooth, fill= cond))  + geom_density(alpha=.4) + xlab("tcf1.smooth") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.line = element_line(colour = "black"), text=element_text(size=16) )+ ggtitle(title) 
+  }
+  
+  else if (data_type == "deriv"){
+     hist <- ggplot(df, aes(x=tcf1.deriv, fill= cond))  + geom_histogram(binwidth=5000, alpha=.4, position= 'identity')  + xlim(-.5e5, 2e5) + labs(x = "synthesis rate") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.line = element_line(colour = "black"), text=element_text(size=16), legend.title=element_blank() )+ ggtitle(title) +
+    scale_fill_manual(values=c("darkgoldenrod2", "darkgoldenrod4")) 
+    
+      dens <- ggplot(df, aes(x=tcf1.deriv, fill= cond))  + geom_density(alpha=.4) + xlim(-.5e5, 2e5) + xlab("tcf1.deriv") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.line = element_line(colour = "black"), text=element_text(size=16), legend.title=element_blank() )+ ggtitle(title) 
+    }
+
+  else if (data_type == "log deriv"){
+     hist <- ggplot(df, aes(x=tcf1.deriv.log10_new, fill= cond))  + geom_histogram(bins=1000, alpha=.4, position= 'identity') + xlim(4,6) + xlab("tcf1.deriv.log10_new") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.line = element_line(colour = "black"), text=element_text(size=16) )+ ggtitle(title)
+    
+      dens <- ggplot(df, aes(x=tcf1.deriv.log10_new, fill= cond))  + geom_density(alpha=.4) + xlim(4,6) +xlab("tcf1.deriv.log10_new") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.line = element_line(colour = "black"), text=element_text(size=16) )+ ggtitle(title) 
+    }
+  
+  else {
+    print("incorrect data type entered")
+  }
+  
+}
+    return(list(hist,dens))
+}
+
+
+```
+
+
+
+## Main Script
+# User input: file locations, field names
+Note that folder containing files must end in "_" followed by the experimental condition in order for the condition to be correctly stored in the dataframe
+```{r}
+# USER INPUT
+field_names_fluor <- c("t", "area", "tbet", "tcf1", "cd69", "tbet.smooth", "tbet.deriv", "tcf1.smooth", "tcf1.deriv") 
+field_names_trs <- c("tr", "gen", "edata", "children")
+
+# if running on multiple files
+path <- "~/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/Matlab_Imaging_Transfer/20200129_CD8_KL_infl/R_input_102721"
+pattern <- "trlong.mat"
+pattern_trs <- "trlong_trs.mat"
+
+# if running in single file
+# filename <- "~/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/Matlab_Imaging_Transfer/20200129_CD8_KL_infl/R_input/tracks_trlong_only_0IL12/pos 10_trlong.mat"
+
+
+```
+
+# Import data from trlong.mat file. This includes time, track number, divtime logical, area, and all fluor and processed fluor channels
+```{r}
+
+# loop through all filenames
+filename_list <- list.files(path, pattern, full.names = T, recursive = T) 
+
+lin_tb_all_pos_list <- list()
+tracks_all_pos_list <- list()
+for (f in seq(from = 1, to = length(filename_list))){
+  filename <- filename_list[[f]]
+  print(filename)
+  # call read_trlong
+  main_lin_tb <- read_trlong(filename, field_names_fluor)
+  
+  # call stack_tracks to make a single df for one position that contains all data
+  all_tracks_df <- stack_tracks(main_lin_tb)
+  
+  # store outputs in respective lists
+  lin_tb_all_pos_list[[f]] <- main_lin_tb
+  tracks_all_pos_list[[f]] <- all_tracks_df
+  
+}
+
+# Now stack data from all tracks and all positions into a single tibble
+all_pos_df <- stack_pos(tracks_all_pos_list, filename_list)
+
+# Compute log 10 transform of tbet.deriv and tcf1.deriv after adding pseuodocount
+# all_pos_df <- log_deriv(all_pos_df, 1)
+all_pos_df <- log_deriv(all_pos_df, 2000, 25000)
+
+
+```
+
+# Import data from trlong_trs.mat file. This includes track number, generation, edata (death flag), children
+```{r}
+# loop through all filenames
+filename_list <- list.files(path, pattern_trs, full.names = T, recursive = T) 
+
+lin_tb_all_pos_list_trs <- list()
+for (f in seq(from = 1, to = length(filename_list))){
+  print(f)
+  filename <- filename_list[[f]]
+  # call read_trlong
+  main_lin_tb <- read_trlong_trs(filename)
+   
+  # store outputs in respective lists
+  lin_tb_all_pos_list_trs[[f]] <- main_lin_tb
+  
+}
+
+# Now stack data from all tracks and all positions into a single tibble
+trs_all_pos_df <- bind_rows(lin_tb_all_pos_list_trs)
+
+```
+
+# Now augment all_pos_df (trlong data) with infromation from trlong_trs 
+```{r}
+# add new empty columns
+all_pos_df <- all_pos_df %>% add_column(gen = 0, .after = "tr_num")
+all_pos_df <- all_pos_df %>% add_column(child_1 = 0, .after = "gen")
+all_pos_df <- all_pos_df %>% add_column(child_2 = 0, .after = "child_1")
+all_pos_df <- all_pos_df %>% add_column(death_flag = 0, .after = "child_2")
+
+
+# use a for loop
+for (r in seq(from=1, to = dim(trs_all_pos_df)[1])){
+  tr_row <- trs_all_pos_df[r,]
+  all_pos_df[(all_pos_df$pos == tr_row$pos & all_pos_df$tr_num == tr_row$tr), ]$gen <- as.numeric(unlist(tr_row$gen))
+  all_pos_df[(all_pos_df$pos == tr_row$pos & all_pos_df$tr_num == tr_row$tr), ]$child_1 <- tr_row$child_1
+  all_pos_df[(all_pos_df$pos == tr_row$pos & all_pos_df$tr_num == tr_row$tr), ]$child_2 <- tr_row$child_2
+  if (length(as.numeric(unlist(tr_row$edata))) == 0) {
+    all_pos_df[(all_pos_df$pos == tr_row$pos & all_pos_df$tr_num == tr_row$tr), ]$death_flag <- 0
+  } else {
+    all_pos_df[(all_pos_df$pos == tr_row$pos & all_pos_df$tr_num == tr_row$tr), ]$death_flag <- as.numeric(unlist(tr_row$edata))
+  }
+}
+
+```
+
+# Save all_pos_df before making state predictions
+```{r}
+saveRDS(all_pos_df, file ="/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/all_pos_df_102721")
+```
+
+# Load all pos
+```{r}
+all_pos_df <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/all_pos_df_102721")
+```
+
+# Plot histograms of the data
+To generate histograms without multiple counting of progenitor cells, use all_pos_df_distinct
+```{r}
+all_pos_df_distinct <- all_pos_df %>% distinct(pos, t, tr_num, .keep_all = TRUE)
+
+# TCF1
+# without filtering
+plot_overlay("tcf1", all_pos_df, 0, 150, "intensity")[[1]]
+plot_overlay("tcf1", all_pos_df, 0, 150, "intensity")[[2]]
+plot_overlay("tcf1", all_pos_df, 0, 150, "deriv")[[1]]
+plot_overlay("tcf1", all_pos_df, 0, 150, "deriv")[[2]]
+plot_overlay("tcf1", all_pos_df, 0, 150, "log deriv")[[1]]
+plot_overlay("tcf1", all_pos_df, 0, 150, "log deriv")[[2]]
+
+# with filtering
+plot_overlay("tcf1", all_pos_df_distinct, 0, 150, "intensity")[[1]]
+plot_overlay("tcf1", all_pos_df_distinct, 0, 150, "intensity")[[2]]
+plot_overlay("tcf1", all_pos_df_distinct, 0, 150, "deriv")[[1]]
+plot_overlay("tcf1", all_pos_df_distinct, 0, 150, "deriv")[[2]]
+plot_overlay("tcf1", all_pos_df_distinct, 0, 150, "log deriv")[[1]]
+
+#overlays
+plot_overlay("tcf1", all_pos_df_distinct, 0, 150, "deriv")[[1]]
+plot_overlay("tcf1", all_pos_df_distinct, 0, 150,"deriv")[[2]]
+
+plot_overlay("tcf1", all_pos_df_distinct, 0, 10,"deriv")[[1]]
+plot_overlay("tcf1", all_pos_df_distinct, 0, 10,"deriv")[[2]]
+
+plot_overlay("tcf1", all_pos_df_distinct, 20, 40,"deriv")[[1]]
+plot_overlay("tcf1", all_pos_df_distinct,20, 40,"deriv")[[2]]
+
+plot_overlay("tcf1", all_pos_df_distinct, 40, 60,"deriv")[[1]]
+plot_overlay("tcf1", all_pos_df_distinct,40, 60,"deriv")[[2]]
+
+plot_overlay("tcf1", all_pos_df_distinct, 60, 80,"deriv")[[1]]
+plot_overlay("tcf1", all_pos_df_distinct,60, 80,"deriv")[[2]]
+
+plot_overlay("tcf1", all_pos_df_distinct, 80, 150,"deriv")[[1]]
+plot_overlay("tcf1", all_pos_df_distinct,80, 150,"deriv")[[2]]
+
+```
+
+# Fit distributions for inputing inital conditions into HMM
+```{r}
+
+all_pos_df <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/all_pos_df_102721")
+
+# take distinct
+df <- all_pos_df %>% distinct(pos, t, tr_num, .keep_all = TRUE)
+
+# function to fit 
+fit_dist_subset <- function(df, fit_col, t_low, t_high, x_low, x_high){
+  df<- subset(df, t>t_low & t<t_high)
+  df <- df[which(df[fit_col] > x_low & df[fit_col] < x_high ), ]
+  data_vec <- pull(df, fit_col)
+  fit_norm <- fitdistr(data_vec, densfun="normal")
+  
+  
+  
+  
+  # plot 
+  title <- paste(fit_col, " (", x_low, " to ", x_high, "), ",  t_low, "hr < t < ", t_high, "hr", sep="") 
+  g<-ggplot(data = df) +
+  geom_histogram(mapping = aes(x = tcf1.deriv, y = ..density..)) +
+  stat_function(fun = dnorm, 
+      args = list(mean = fit_norm$estimate[1], sd = fit_norm$estimate[2], log = F), 
+      color="red", lwd=1) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.line = element_line(colour = "black")) + labs(title = title, caption = paste("mean:", round(fit_norm$estimate[1],2), "\n sd:", round(fit_norm$estimate[2],2), sep=" "))
+  
+  return(list(fit_norm, g))
+}
+
+
+# Tcf1 
+fit_col <- "tcf1.deriv"
+t_low <- 20
+t_high <- 40
+x_low <- 0
+x_high <- 150000
+# # subset by cond
+# df<- subset(df, cond == "0IL12")
+# fit and plot
+fit_output <- fit_dist_subset(df, fit_col, t_low, t_high, x_low, x_high)
+fit_params <- fit_output[[1]]
+fit_params
+fit_output[[2]]
+
+
+```
+
+# Run HMM
+```{r}
+
+all_pos_df <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/all_pos_df_102721")
+
+# data - 
+df <- all_pos_df
+
+# Input parameters for HMM: copy from text file that stores states (20200129_HMM_msm_states.txt)
+
+# TCF1
+# model 3 -- (Model 1 in suppl. figure)
+# 4 state (linear):
+num_states <- 4
+data_channel <- "tcf1"
+qmatrix_init <- rbind(c(0, 0, .01, .01), c(0, 0, .01, .01), c(0, .01, 0, .01), c(0, .01, .01, 0)) # transitions
+state_params <- rbind(c(-8000,13000), c(10000,13000), c(30000,22000), c(60000,17830)) # rows are states, columns are mu and sigma
+ranges <- list(mean = list(lower=c(-20000,0,20000,50000), upper=c(-3000,15000,35000,120000)))
+
+# # model 2 -- (Model 2 in suppl. figure)
+# #6/24 - 4 states
+# # TCF1
+# # 4 state (linear):
+# num_states <- 4
+# data_channel <- "tcf1"
+# qmatrix_init <- rbind(c(0, 0, .01, .01), c(0, 0, .01, .01), c(0, .01, 0, .01), c(0, .01, .01, 0)) # transitions
+# state_params <- rbind(c(-8000,13000), c(10000,13000), c(30000,22000), c(60000,17830)) # rows are states, columns are mu and sigma
+# ranges <- list(mean = list(lower=c(-12000,8000,20000,50000), upper=c(-3000,15000,35000,120000)))
+
+# # model 4 (Model 3 in suppl. figure)
+# #6/24 - 3 states
+# # TCF1
+# # 3 state (linear):
+# num_states <- 3
+# data_channel <- "tcf1"
+# qmatrix_init <- rbind(c(0, .01, .01), c(0, 0, .01), c(0, .01, 0)) # transitions
+# state_params <- rbind(c(-8000,13000), c(10000,13000), c(40000,22000)) # rows are states, columns are mu and sigma
+# ranges <- list(mean = list(lower=c(-12000,8000,20000), upper=c(-3000,15000,120000)))
+
+# # model 5 (Model 4 in suppl. figure)
+# #6/24 - 3 states
+# # TCF1
+# # 3 state (linear):
+# num_states <- 3
+# data_channel <- "tcf1"
+# qmatrix_init <- rbind(c(0, .01, .01), c(0, 0, .01), c(0, .01, 0)) # transitions
+# state_params <- rbind(c(-8000,13000), c(10000,13000), c(40000,22000)) # rows are states, columns are mu and sigma
+# ranges <- list(mean = list(lower=c(-20000,0,20000), upper=c(-3000,15000,120000)))
+
+
+###
+
+hmodel_in <- list()
+for (i in seq(from=1, to=num_states)){
+  mean1 <- state_params[i,1]
+  sd1 <- state_params[i,2]
+  hmodel_in[[i]] <- hmmNorm(mean = mean1, sd = sd1)
+}
+
+# make sure model input is correct
+print(hmodel_in)
+
+# Run model 
+data_channel == "tcf1"
+fit <- msm(tcf1.deriv ~ t, subject=ID, data = df,
+qmatrix = qmatrix_init, # qmatrix indicates allowed transitions
+hmodel = hmodel_in,
+hranges = ranges,
+control = list(fnscale = 50000) )
+
+#save fits (msm object) with model number
+#saveRDS(fit, file ="/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/Tcf1_model3_102721")
+# saveRDS(fit, file ="/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/Tcf1_model2_102721")
+# saveRDS(fit, file ="/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/Tcf1_model4_102721")
+# saveRDS(fit, file ="/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/Tcf1_model5_102721")
+
+# compare 102721 fits
+fit_m3 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/Tcf1_model3_102721")
+fit_m2 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/Tcf1_model2_102721")
+fit_m4 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/Tcf1_model4_102721")
+fit_m5 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/Tcf1_model5_102721")
+
+```
+
+
+```{r}
+# Run viterbi from fit
+
+run_viterbi <- function(fit, data_channel, df_in){
+  vit <- viterbi.msm(fit)
+  vit <- vit %>% dplyr::select(-observed, -pstate)
+  if (data_channel == "tbet"){
+    vit <- rename(vit, tbet_fit = fitted, t = time, ID = subject)
+  } else if (data_channel == "tcf1") {
+    vit <- rename(vit, tcf1_fit = fitted, t = time, ID = subject)
+  }
+  df_out <- merge(df_in, vit)
+  return(df_out)
+}
+
+# load model
+fit_tcf1_m3 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/Tcf1_model3_102721")
+
+# models to run
+fit_tcf1 <- fit_tcf1_m3
+
+# load original dataframe
+all_pos_df <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/all_pos_df_102721")
+df <- all_pos_df
+
+# add tcf1 fit
+df_tcf1_fit_all <- run_viterbi(fit_tcf1, "tcf1", df)
+
+# name prediction dfs
+pred <- df_tcf1_fit_all
+pred_0IL12 <- subset(pred, cond=="0IL12") 
+pred_1IL12 <- subset(pred, cond=="1IL12") 
+
+# save pred_0IL12 and pred_1IL12
+# saveRDS(pred_0IL12, file = "/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_0IL12_102721_tcf1-m3")
+# saveRDS(pred_1IL12, file = "/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_1IL12_102721_tcf1-m3")
+
+
+```
+
+# Filter out spurious state transitions
+Here I will find all states with duration equal to or less than 8 hrs 
+I will ad tcf1_fit column but maintain the original fit column as well
+Grouping by lineage, find the run lengths that are 32 time points are less. Confirm that these short runs are actually =< 8 hrs by checking t column. If yes, convert these states to the previous state. I will first filter out the shorters runs first until there are no runs remaining =< 8 hrs.
+# Additionally, add columns with activation and silencing events
+```{r}
+
+#tcf1
+filter_spurious_states_tcf1 <- function(.data, ...) {
+  if (dplyr::is_grouped_df(.data)) {
+    return(dplyr::do(.data, filter_spurious_states_tcf1(., ...)))
+  }
+
+  # start function code
+  # add filtered column
+  new_col_name <- paste(fit_col,"_filtered", sep="")
+  .data <- .data %>% arrange(t) %>% add_column(!!(new_col_name) := 0, .after= fit_col)
+  .data$tcf1_fit_filtered <- .data$tcf1_fit
+  # add event column
+  .data <- .data %>% add_column("tcf1_event" = "none", .after= "tcf1_fit_filtered")
+  .data <- .data %>% add_column("tcf1_event_state" = 0, .after= "tcf1_event")
+
+  runs <- rle(.data$tcf1_fit_filtered)
+  runs_mod <- runs
+  min_run_len <- min(runs$lengths)
+  max_iter <- length(runs$lengths)
+  iter <- 1
+  skipped_run_starts <- c()
+  while (min_run_len <= run_thresh_rows & (iter < max_iter)) {
+    loc <- which.min(runs_mod$lengths) # location of first instance of minimum run length
+    run_end <- sum(runs$lengths[1:loc])
+    run_start <- run_end - min_run_len + 1
+    run_time <- .data[run_end,]$t - .data[run_start,]$t
+    if (run_time <= run_thresh_time & length(.data[run_start-1,]$tcf1_fit_filtered) !=0) {
+      .data[run_start:run_end,]$tcf1_fit_filtered <- .data[run_start-1,]$tcf1_fit_filtered
+    } else{
+      skipped_run_starts <- append(skipped_run_starts, run_start) # add to skipped locs
+    }
+    runs <- rle(.data$tcf1_fit_filtered)
+    # go through each of the newly calculated runs and make sure none of them are in skipped_run_starts; if they are, set that value in runs$lengths equal to NA
+    runs_mod <- runs
+    for (m in seq(from=1, to=length(runs_mod$lengths))){
+      test_run_len <- runs_mod$lengths[m]
+      test_loc <- m
+      test_run_end <- sum(runs$lengths[1:test_loc]) # here note using original runs$lengths
+      test_run_start <- test_run_end - test_run_len + 1 
+      if (test_run_start %in% skipped_run_starts) {
+        runs_mod$lengths[m] <- NA
+      }
+    }
+    min_run_len <- min(runs_mod$lengths, na.rm = TRUE)
+    iter <- iter+1
+  }
+
+  # Now add event data using the run information (silencing / activation info only)
+  if (length(runs$values) > 1){
+    for (r in seq(from=2, to=length(runs$values))){
+      if (runs$values[r] %in% ON_states & runs$values[r-1] %in% OFF_states){
+        event_row <- sum(runs$lengths[1:(r-1)])+1
+        .data[event_row,]$tcf1_event <- "A"
+      } else if (runs$values[r] %in% OFF_states & runs$values[r-1] %in% ON_states){
+          event_row <- sum(runs$lengths[1:(r-1)])+1
+          .data[event_row,]$tcf1_event <- "S"
+      }
+    }
+  }
+  
+  # Add event row for more specific transitions 
+  # this is hard coded specifically for the TCF1 4 state model 
+   if (length(runs$values) > 1){
+    for (r in seq(from=2, to=length(runs$values))){
+      if (runs$values[r] == 3 & runs$values[r-1] %in% c(1, 2, 4)){
+        event_row <- sum(runs$lengths[1:(r-1)])+1
+        .data[event_row,]$tcf1_event_state <- 3
+      } else if (runs$values[r] == 4 & runs$values[r-1] %in% c(1, 2, 3)){
+          event_row <- sum(runs$lengths[1:(r-1)])+1
+          .data[event_row,]$tcf1_event_state <- 4
+      } else if (runs$values[r] == 2 & runs$values[r-1] %in% c(1, 3, 4)){
+          event_row <- sum(runs$lengths[1:(r-1)])+1
+          .data[event_row,]$tcf1_event_state <- 2
+      }
+    }
+   }
+  
+  return(.data)
+}
+
+##################################################################################################################
+
+pred_0IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_0IL12_102721_tcf1-m3")
+pred_1IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_1IL12_102721_tcf1-m3")
+
+run_thresh_rows <- 32
+run_thresh_time <- 8
+
+# filter tcf1 states
+fit_col <- "tcf1_fit"
+ON_states <- c(3,4)
+OFF_states <- c(1,2)
+pred_0IL12 <- pred_0IL12 %>% group_by(ID) %>% filter_spurious_states_tcf1(., run_thresh_rows, run_thresh_time, fit_col, ON_states, OFF_states) %>% ungroup()
+pred_1IL12 <- pred_1IL12 %>% group_by(ID) %>% filter_spurious_states_tcf1(., run_thresh_rows, run_thresh_time, fit_col, ON_states, OFF_states) %>% ungroup()
+
+
+saveRDS(pred_0IL12, file = "/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_0IL12_102721_tcf1-m3_filtered")
+saveRDS(pred_1IL12, file = "/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_1IL12_102721_tcf1-m3_filtered")
+
+# plots to check filtering of individual positions
+pred <- pred_1IL12 %>% subset(ID == "pos 91 1_10")
+plot(pred$t, pred$tcf1_fit)
+plot(pred$t, pred$tcf1_fit_filtered)
+```
+
+
+# Goodness of fit analysis
+- For each state, sum the total counts of promoter activities classified as that state. Take this as an approximation for AUC, e.g. height of gaussian for now.
+- Plot theoretical gaussians on promoter activity histograms 
+
+```{r}
+
+output_folder_fit <- "/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/goodness_fit_102721"
+
+# funtion to assess quality of fit for each state
+plot_theor_expt_fits <- function(cond, df, fit_col, state_col, state, mu, sigma){
+  # subset df by state
+  df <- subset(df, df[state_col] == state)
+  sum_in_state <- nrow(df)
+  
+  # density curve of experimental data
+  d <- density(unlist(df[fit_col]))
+  x <- d$x
+  y_expt <- d$y
+  # density curve of theoretical data (fit)
+  y_theor <- dnorm(x, mu, sigma)
+  dx <- x[2]-x[1]
+  
+  # residuals
+  res <- (mu - unlist(df[fit_col]))
+  
+  quantile_df <- data.frame("x" = d$x, "y_expt" = y_expt, "y_theor" = y_theor)
+  quantile_df$sum_expt <- cumsum(quantile_df$y_expt*dx)
+  quantile_df$sum_theor <- cumsum(quantile_df$y_theor*dx)
+  
+  
+  gg_theme <- theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.line = element_line(colour = "black"), text=element_text(size=20), axis.text = element_text(size=24)) 
+   
+  # overlay experimental and theoretical distributions
+  g1 <- ggplot(quantile_df) +
+     geom_line(aes(x = x, y = y_expt)) +
+    geom_line(aes(x = x, y = y_theor), color = "steelblue") +
+    gg_theme + 
+    ggtitle(paste("State ", state, ", Expt vs. Theor Dist", sep="")) +
+    xlab("promoter activity") + ylab("density")
+  
+  # experimental and theoretical quantiles
+  g2 <- ggplot(quantile_df) + 
+    geom_point(aes(x = sum_theor, y = sum_expt)) +
+    geom_line(aes(x = sum_expt, y = sum_expt), color = "steelblue") + 
+    gg_theme+ 
+    ggtitle(paste("State ", state, ", Expt vs. Theor Quantiles", sep=""))+ 
+    xlab("AUC theoretical") + ylab("AUC experimental")
+  
+  # qqplot of residuals (e.g. are residuals normally distributed?)
+  # options(scipen=999) # prevent scientific notation
+  png(file.path(output_folder_fit, paste("residuals_state", state, ".png", sep="")), width = 300, height = 300)
+  par(pty="s")
+  # qqnorm(res, main = paste("State ", state, ", Residuals", sep=""), cex.axis = 2, cex.lab = 2)
+  qqnorm(res, main ="", ylab="", xlab="", cex.axis = 1.5, cex.lab = 1.5)
+  qqline(res)
+  dev.off()
+  
+  
+
+  return(list(g1, g2, sum_in_state))
+}
+
+####
+pred_0IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_0IL12_102721_tcf1-m3_filtered")
+pred_1IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_1IL12_102721_tcf1-m3_filtered")
+
+####
+
+# Tcf1 m3
+cond <- "all"
+df <- rbind(pred_0IL12, pred_1IL12)
+fit_col <- "tcf1.deriv"
+state_col <- "tcf1_fit_filtered"
+s1_fit <- plot_theor_expt_fits(cond, df, fit_col, state_col, 1, -15042.79, 11007.98)
+png(file.path(output_folder_fit, paste("dist_state", 1, ".png", sep="")), width = 300, height = 300)
+s1_fit[[1]]
+dev.off()
+png(file.path(output_folder_fit, paste("quantiles_state", 1, ".png", sep="")), width = 300, height = 300)
+s1_fit[[2]]
+dev.off()
+
+s2_fit <- plot_theor_expt_fits(cond, df, fit_col, state_col, 2,  5544.265, 8286.387)
+png(file.path(output_folder_fit, paste("dist_state", 2, ".png", sep="")), width = 300, height = 300)
+s2_fit[[1]]
+dev.off()
+png(file.path(output_folder_fit, paste("quantiles_state", 2, ".png", sep="")), width = 300, height = 300)
+s2_fit[[2]]
+dev.off()
+
+s3_fit <- plot_theor_expt_fits(cond, df, fit_col, state_col, 3, 27665.118, 6729.124)
+png(file.path(output_folder_fit, paste("dist_state", 3, ".png", sep="")), width = 300, height = 300)
+s3_fit[[1]]
+dev.off()
+png(file.path(output_folder_fit, paste("quantiles_state", 3, ".png", sep="")), width = 300, height = 300)
+s3_fit[[2]]
+dev.off()
+
+s4_fit <- plot_theor_expt_fits(cond, df, fit_col, state_col, 4, 64391.54, 28295.92)
+png(file.path(output_folder_fit, paste("dist_state", 4, ".png", sep="")), width = 300, height = 300)
+s4_fit[[1]]
+dev.off()
+png(file.path(output_folder_fit, paste("quantiles_state", 4, ".png", sep="")), width = 300, height = 300)
+s4_fit[[2]]
+dev.off()
+
+
+
+```
+
+
+# Get some lineage statistics
+```{r}
+## INPUT
+pred_0IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_0IL12_102721_tcf1-m3_filtered")
+pred_1IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_1IL12_102721_tcf1-m3_filtered")
+
+# combine
+df_pred <- rbind(pred_0IL12, pred_1IL12)
+# add lin column
+lin_col <- sapply(strsplit(df_pred$lin_tr, "_"), `[`, 1)
+longtrack_col <- sapply(strsplit(df_pred$lin_tr, "_"), `[`, 2)
+df_pred <- df_pred %>% add_column(lin = as.numeric(lin_col), .after = "pos" )
+df_pred <- df_pred %>% add_column(longtrack = as.numeric(longtrack_col), .after = "lin" )
+
+# For each lineage, get max gen
+max_gen <- df_pred %>% group_by(pos, lin) %>% summarise(max_gen = max(gen))
+ave_gen <- mean(max_gen$max_gen)
+
+# Number of lineages
+total_lin <- nrow(max_gen)
+
+# combine dfs; add lin and longtrack columns
+df_pred <- rbind(pred_0IL12, pred_1IL12)
+lin_col <- sapply(strsplit(df_pred$lin_tr, "_"), `[`, 1)
+longtrack_col <- sapply(strsplit(df_pred$lin_tr, "_"), `[`, 2)
+df_pred <- df_pred %>% add_column(lin = as.numeric(lin_col), .after = "pos" )
+df_pred <- df_pred %>% add_column(longtrack = as.numeric(longtrack_col), .after = "lin" )
+
+pos_lin <- df_pred %>% distinct(pos, lin)
+
+```
+
+
+# Get final cell number for each longtrack
+```{r}
+pred_0IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_0IL12_102721_tcf1-m3_filtered")
+pred_1IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_1IL12_102721_tcf1-m3_filtered")
+
+df_pred <- rbind(pred_0IL12, pred_1IL12)
+
+df_longtrack_final_cell <- df_pred %>% group_by(pos, ID) %>% summarise(lin = as.numeric(strsplit(lin_tr, "_")[[1]][1]), longtrack = as.numeric(strsplit(lin_tr, "_")[[1]][2]), final_cell = tr_num[which(t == max(t))], child_1 = child_1[which(t == max(t))], child_2 = child_2[which(t == max(t))]) %>% arrange(pos, lin, longtrack) %>% ungroup()
+
+# pull out indiviual position and/or lineage
+df_longtrack_final_cell_pos91 <- df_longtrack_final_cell %>% filter(pos == 'pos 91', lin == '2')
+
+```
+
+
+# Plot HMM results - filtered -- may remove
+For now, plot TCF1 promoter states only
+(include Tbet code commented out)
+Include new TCF1 2 on states 
+Normalize across all tracks plotted
+Include capabiliy to plot only a subset of positions or conditions
+```{r}
+state_colors = c("1" = "#000004FF", # viridis::inferno 5 color
+                                    "2" = "#56106EFF",
+                                    "3" = "#BB3754FF",
+                                  "4" = "#F98C0AFF")
+
+pred_0IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_0IL12_102721_tcf1-m3_filtered")
+pred_1IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_1IL12_102721_tcf1-m3_filtered")
+
+plot_longtracks_subset <- function(df, t_lim=100, position = NULL){
+  
+  normalize <- function(x) {
+    return ((x - min(x)) / (max(x) - min(x)))
+  }
+  
+  # first subset 
+  if (!is_null(position)){
+    pred <- subset(df, pos == position & t <= t_lim)
+  }else{pred <- df}
+  
+  # with normalization
+  pred$tcf1.smooth.norm <- normalize(pred$tcf1.smooth)
+  pred$cd69.norm <- normalize(pred$cd69)
+
+  plots <- pred %>% 
+  group_by(ID) %>%
+  do(
+    plot = {
+    # norm
+    p <- ggplot(., aes(t, tcf1.smooth.norm, group = ID, color = factor(tcf1_fit_filtered))) +
+    # without norm
+      # p <- ggplot(., aes(t, tcf1.smooth, group = ID, color = factor(tcf1_fit_filtered))) +
+
+    geom_line( alpha = 1, size = 1.2) +
+            scale_color_manual(name = "tcf1_fit_filtered",
+                       values = state_colors) +
+      
+      #divtimes
+      geom_vline(xintercept = .[which(.$divtimes == TRUE), ]$t, linetype = "dashed", color = "gray50") +
+
+      #theme
+      #if normalizing, use ylim(0,1)
+      xlim(0,t_lim) + ylim(0,1) + labs(x = "Time (hrs)", y = "Intensity (a.u.)") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.ticks.y=element_blank(), axis.text.y = element_blank(), axis.line = element_line(colour = "black"), text=element_text(size=18), legend.position = "none") +
+      # ggtitle(.$ID)
+      # otherwise, use ylim(0, 6e6) and include y axis ticks and labels
+      # xlim(0,t_lim) + ylim(0,6e6) + labs(x = "Time (hrs)", y = "Intensity (a.u.)") + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.line = element_line(colour = "black"), text=element_text(size=18), legend.position = "none") + 
+      ggtitle(.$ID)
+    
+    p
+  })
+
+# view
+# save all plots to single pdf
+pdf("2021.03_longtracks_color-state/pos91_norm.pdf")
+num <- nrow(distinct(df, ID))
+require(lattice)
+for (p in seq(from=1, to=num)){
+  print(plots$plot[[p]])
+}
+dev.off
+
+ 
+}
+
+plot_longtracks_subset(df_pred %>% filter(pos=="pos 91"))
+
+```
+
+# Plot lineage trees
+
+# Lineage tree plot function
+```{r}
+lineage_tree <- function(position, lineage, df_pred, state_colors){
+
+  df_pred <- df_pred %>% filter(pos == position, lin == lineage) # take a single lineage
+  # select only relevant columns and add column for t_max to df_pred
+  df_pred <- df_pred %>% group_by(tr_num) %>% mutate(t_max = max(t)) %>% ungroup()
+  # df_pred <- df_pred %>% dplyr::select(t, pos, lin, tr_num, gen, child_1, child_2, tcf1_fit_filtered) %>% group_by(tr_num) %>% mutate(t_max = max(t)) %>% ungroup()
+  
+  ######
+  # calculate total cell cycle time and add to df_pred
+  time_summary <- df_pred %>% group_by(pos, tr_num) %>% summarise(total_t_cellcycle = max(t)-min(t)) %>% mutate(pos_tr_num = paste(pos, tr_num, sep="_"), .after= tr_num)
+  df_pred <- df_pred %>% mutate(pos_tr_num = paste(pos, tr_num, sep="_"), .after= tr_num) # add pos_tr_num ID to df_pred
+  df_pred$total_t_cellcycle <- time_summary[match(df_pred$pos_tr_num, time_summary$pos_tr_num), ]$total_t_cellcycle 
+  
+  # Go through every unique pos and track number and check activity state of parent and all children at end of cell cycle; also check cell cycle length
+  end_state_sum <- df_pred %>% group_by(ID, cond, pos, longtrack, tr_num, gen, child_1, child_2, total_t_cellcycle) %>% summarise(max_t = max(t), end_state = tcf1_fit_filtered[which(t==max(t))]) %>% ungroup()
+  
+  # function to calculate state duration and state start time
+  state_duration <- function(df_pred, tr_ID, max_t){
+    df_pred <- df_pred %>% filter(ID == tr_ID)
+    fit_col <- df_pred$tcf1_fit_filtered
+    t_col <- df_pred$t
+    runs <- rle(fit_col)
+    run_lengths <- runs$lengths
+    run_state <- runs$values
+    for (i in seq(from=1, to = length(run_lengths))){
+      run_end <- sum(run_lengths[1:i])
+      if (i==1){run_start =1 }
+      else{
+        run_start <- sum(run_lengths[1:(i-1)]) +1
+      }
+      # print(t_col[run_start:run_end])
+      if (max_t %in% t_col[run_start:run_end]){ # if the run contains the ending time point of the cell of interest (max_t)
+        t_run <- t_col[run_end] - t_col[run_start]
+        t_start <- t_col[run_start]
+      }
+    }
+    return(list(t_run, t_start))
+  }
+  
+  # Determine the duration and starting time of the ending state of a cell
+  end_state_sum <- end_state_sum %>% rowwise() %>% mutate(end_state_dur = state_duration(df_pred, ID, max_t)[1], end_state_start = state_duration(df_pred, ID, max_t)[2])
+  end_state_sum$end_state_dur <-unlist(end_state_sum$end_state_dur)
+  end_state_sum$end_state_start <-unlist(end_state_sum$end_state_start)
+  end_state_sum <- end_state_sum %>% ungroup()
+  
+  # end_state_sum contains multipe rows for each unique position and track number corresponding to the different longtracks that contain it
+  # now, select which longtrack info to use for state determination by selecting the longtrack where the state has the earliest start time (or for gen1, the latest start time)
+  end_state_sum_gen1 <- end_state_sum %>% filter(gen == 1)
+  end_state_sum_othergen <- end_state_sum %>% filter(gen != 1)
+  end_state_sum_gen1_single <- end_state_sum_gen1 %>% group_by(pos, tr_num) %>% filter(longtrack == longtrack[which(end_state_start == max(end_state_start))][1])
+  end_state_sum_othergen_single <- end_state_sum_othergen %>% group_by(pos, tr_num) %>% filter(longtrack == longtrack[which(end_state_start ==min(end_state_start))][1])
+  end_state_sum_single <- rbind(end_state_sum_gen1_single, end_state_sum_othergen_single)
+  
+  # get distinct tracks in lineage
+  lin_plot <- df_pred %>% distinct(tr_num, .keep_all = TRUE) %>% dplyr::select(t, pos, lin, tr_num, gen, child_1, child_2, tcf1_fit_filtered) # include only distinct  tr_num
+  
+  # generate dataframe with tr_num and y value and t start 
+  y_vals <- data.frame("tr_num"=numeric(), "y"=numeric(), "t_start"=numeric())
+  # add starting clone at y = 0
+  y_vals <- y_vals %>% add_row("tr_num"=lin_plot$tr_num[1], "y"=0, "t_start"=0)
+  for (i in seq(from=1, to=nrow(lin_plot))){
+    c1 <- lin_plot$child_1[i]
+    c2 <- lin_plot$child_2[i]
+    p <- lin_plot$tr_num[i] # parent
+    p_y <- y_vals[match(p, y_vals$tr_num), ]$y # parent y value
+    c_gen <- lin_plot$gen[i] + 1
+    c_delta <- 0.5 / (2**(c_gen - 2) )
+    c1_y <- p_y + c_delta
+    c2_y <- p_y - c_delta
+    c1_tstart <- df_pred %>% filter(tr_num == c1) %>% summarise(c1_tstart = min(t))
+    c2_tstart <- df_pred %>% filter(tr_num == c2) %>% summarise(c2_tstart = min(t))
+    y_vals <- y_vals %>% add_row("tr_num"=c1, "y"=c1_y, "t_start"=c1_tstart$c1_tstart[1]) %>% add_row("tr_num"=c2, "y"=c2_y, "t_start"=c2_tstart$c2_tstart[1])
+  }
+  
+  # remove rows of y_vals where tr_num=0
+  y_vals <- y_vals[which(y_vals$tr_num!=0),]
+  # remove rows of y_vals for which there is no matching tr_num in df_pred (e.g. children that are not tracked)
+  y_vals <- y_vals[which(y_vals$tr_num %in% df_pred$tr_num),]
+  
+  # add y_vals y as new columns to df_pred 
+  df_pred$y <- NA
+  df_pred$y <- as.numeric(df_pred$y)
+  df_pred[match(y_vals$tr_num, df_pred$tr_num), ]$y <- y_vals$y
+  
+  # add c1_tstart and c1_y to df_pred
+  df_pred$c1_tstart <- NA
+  df_pred$c1_tstart <- as.numeric(df_pred$c1_tstart)
+  y_vals_child_1 <- y_vals[which(y_vals$tr_num %in% df_pred$child_1), ]
+  df_pred[match(y_vals_child_1$tr_num, df_pred$child_1), ]$c1_tstart <- y_vals_child_1$t_start
+  df_pred$c1_y <- NA
+  df_pred$c1_y <- as.numeric(df_pred$c1_y)
+  y_vals_child_1 <- y_vals[which(y_vals$tr_num %in% df_pred$child_1), ]
+  df_pred[match(y_vals_child_1$tr_num, df_pred$child_1), ]$c1_y <- y_vals_child_1$y
+  # add c2_tstart and c2_y to df_pred
+  df_pred$c2_tstart <- NA
+  df_pred$c2_tstart <- as.numeric(df_pred$c2_tstart)
+  y_vals_child_2 <- y_vals[which(y_vals$tr_num %in% df_pred$child_2), ]
+  df_pred[match(y_vals_child_2$tr_num, df_pred$child_2), ]$c2_tstart <- y_vals_child_2$t_start
+  df_pred$c2_y <- NA
+  df_pred$c2_y <- as.numeric(df_pred$c2_y)
+  y_vals_child_2 <- y_vals[which(y_vals$tr_num %in% df_pred$child_2), ]
+  df_pred[match(y_vals_child_2$tr_num, df_pred$child_2), ]$c2_y <- y_vals_child_2$y
+  # fill down values 
+  #df_pred <- df_pred %>% fill(y)
+  df_pred <- df_pred %>% group_by(tr_num) %>% fill(y,c1_tstart, c1_y, c2_tstart, c2_y) %>% ungroup()
+  
+  # Plot 
+  ### Critical: for plotting, reduce df_pred to distinct tracks so that a cell is not repeated, but specifically keep the longtracks that have the earliest starting state in end_state_sum_single ###
+  
+  x <- sapply(paste(df_pred$tr_num, df_pred$longtrack,sep=  "_"), `[`, 1)
+  df_pred <- df_pred %>% add_column(tr_num_longtrack = x, .after = "longtrack")
+  x <- sapply(paste(end_state_sum_single$tr_num, end_state_sum_single$longtrack,sep=  "_"), `[`, 1)
+  end_state_sum_single <- end_state_sum_single %>% add_column(tr_num_longtrack = x, .after = "longtrack")
+  df_pred_sub <- df_pred[which(df_pred$tr_num_longtrack %in% end_state_sum_single$tr_num_longtrack), ]
+  
+  # plot lineage tree
+  p_lin <- df_pred_sub  %>%
+    ggplot +
+    # cell traces
+     geom_line(aes(x = t, y = y, group = tr_num, color = factor(tcf1_fit_filtered), size = factor(tcf1_fit_filtered))) +
+    scale_color_manual(name = "tcf1_fit_filtered",
+                         values = state_colors) +
+    scale_size_manual(name = "tcf1_fit_filtered", values = c(1, 1, 3, 3), breaks = (c("1","2","3","4"))) +
+  
+    # tr_num text
+    # geom_text(data = distinct(df_pred, tr_num, .keep_all=TRUE), aes(x= t+3, y = y+.05, label = tr_num), size=3) +
+    
+    # connector segments
+    geom_segment(data = distinct(df_pred, tr_num, .keep_all=TRUE), aes(x= t_max, y = y, xend = c1_tstart, yend = c1_y, group = tr_num), size = 0.25) +
+    geom_segment(data = distinct(df_pred, tr_num, .keep_all=TRUE), aes(x= t_max, y = y, xend = c2_tstart, yend = c2_y, group = tr_num), size = 0.25) +
+    
+    # title
+    #ggtitle(paste(position, ", lin", lineage, sep="" )) +
+    
+    # xlim
+    xlim(0,75)+
+    
+        # theme
+        theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.ticks.y=element_blank(), axis.text.y = element_blank(),  axis.title.y = element_blank(), axis.line.y = element_blank(), axis.line.x = element_line(colour = "black"), text=element_text(size=10), legend.position = "none") 
+  
+  return(p_lin)
+}
+
+
+```
+
+# Lineage tree implementation
+```{r}
+# folder to save
+out_folder <- "lin_trees_102721"
+
+# set colors 
+state_colors = c("1" = "#000004FF", # viridis::inferno 5 color
+                                    "2" = "#56106EFF",
+                                    "3" = "#BB3754FF",
+                                  "4" = "#F98C0AFF")
+
+# load data 
+pred_0IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_0IL12_102721_tcf1-m3_filtered")
+pred_1IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_1IL12_102721_tcf1-m3_filtered")
+
+# combine dfs; add lin and longtrack columns
+df_pred <- rbind(pred_0IL12, pred_1IL12)
+lin_col <- sapply(strsplit(df_pred$lin_tr, "_"), `[`, 1)
+longtrack_col <- sapply(strsplit(df_pred$lin_tr, "_"), `[`, 2)
+df_pred <- df_pred %>% add_column(lin = as.numeric(lin_col), .after = "pos" )
+df_pred <- df_pred %>% add_column(longtrack = as.numeric(longtrack_col), .after = "lin" )
+
+pos_lin <- df_pred %>% distinct(pos, lin)
+
+for (i in seq(from=1, to = nrow(pos_lin))){
+  position <- pos_lin$pos[i]
+  lineage <- pos_lin$lin[i]
+  p_lin <- suppressWarnings(lineage_tree(position, lineage, df_pred, state_colors))
+  pdf(paste(out_folder, "/", position, "_lin", lineage, ".pdf", sep=""))
+  print(p_lin)
+  dev.off()
+}
+
+
+
+
+```
+
+# Plot longtracks overlaid on single plot -- select subset of longtracks to overlay
+Can highlight specific tracks if desired 
+```{r}
+
+state_colors = c("1" = "#000004FF", # viridis::inferno 5 color
+                                    "2" = "#56106EFF",
+                                    "3" = "#BB3754FF",
+                                  "4" = "#F98C0AFF")
+
+pred_0IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_0IL12_102721_tcf1-m3_filtered")
+pred_1IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_1IL12_102721_tcf1-m3_filtered")
+
+# combine dfs; add lin and longtrack columns
+df_pred <- rbind(pred_0IL12, pred_1IL12)
+lin_col <- sapply(strsplit(df_pred$lin_tr, "_"), `[`, 1)
+longtrack_col <- sapply(strsplit(df_pred$lin_tr, "_"), `[`, 2)
+df_pred <- df_pred %>% add_column(lin = as.numeric(lin_col), .after = "pos" )
+df_pred <- df_pred %>% add_column(longtrack = as.numeric(longtrack_col), .after = "lin" )
+
+# add max
+df_pred <- df_pred %>% group_by(pos, lin) %>% mutate(tcf1_max_e3 = max(tcf1.smooth)/1000000)
+
+# df_pred <- df_pred %>% filter(pos=="pos 91", lin=="2", longtrack %in% c(1,2,3))
+# df_pred <- df_pred %>% filter(pos=="pos 91", lin=="2", longtrack %in% c(4,6,7))
+# df_pred <- df_pred %>% filter(pos=="pos 91", lin=="2", longtrack %in% c(8,9,10,11))
+# df_pred <- df_pred %>% filter(pos=="pos 91", lin=="2", longtrack %in% c(12,13,14,15,16))
+# df_pred <- df_pred %>% filter(pos=="pos 93", lin=="1")
+df_pred <- df_pred %>% filter(pos=="pos 91", lin=="2")
+
+
+options(scipen=10000)
+p_all <- ggplot() + 
+   geom_line(data = df_pred, mapping = aes(x = t, y = tcf1.smooth/1000000, group = ID, color = factor(tcf1_fit_filtered)), alpha = 1, size = 0.5) +
+  # geom_line(data = df_pred, mapping = aes(x = t, y = tcf1.smooth, group = ID), alpha = .2) +
+  # geom_line(data = filter(df_pred, ID ==eff_ID), mapping = aes(x = t, y = tcf1.smooth, group = ID), color = eff_col, alpha = 1, size = 2) +
+  # geom_line(data = filter(df_pred, ID ==mem_ID), mapping = aes(x = t, y = tcf1.smooth, group = ID), color = mem_col, alpha = 1, size = 2) +
+  scale_color_manual(name = "tcf1_fit_filtered",
+                       values = state_colors) +
+  #first divtime
+      geom_vline(data = df_pred, aes(xintercept = df_pred[which(df_pred$divtimes == TRUE)[1], ]$t), linetype = "dashed", color = "gray50") +
+  
+  # ylim(0,tcf1_max_e3) +
+      labs(x = "Time (hrs)", y = expression(Intensity~(x ~10^{"6"}~a.u.))) +
+  ylim(1,3.5)+
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.ticks.y=element_blank(),  axis.line = element_line(colour = "black"), text=element_text(size=18), legend.position = "none")
+p_all
+
+# save_plot(p_all, filename = '/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/5.Experiments_labwork/Analysis/20200129_CD8_KL_infl/R_output_figures_102721/longtracks_color-state/pos93_lin1_all.pdf', base_asp = 1)
+save_plot(p_all, filename = '/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/5.Experiments_labwork/Analysis/20200129_CD8_KL_infl/R_output_figures_102721/longtracks_color-state/pos91_lin2_all.pdf', base_asp = 1)
+```
+
+
+
+
+
+
+
+
+# Plot longtracks overlaid on single plot 
+Add capability to group tracks by different features
+```{r}
+state_colors = c("1" = "#000004FF", # viridis::inferno 5 color
+                                    "2" = "#56106EFF",
+                                    "3" = "#BB3754FF",
+                                  "4" = "#F98C0AFF")
+
+pred_0IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_0IL12_102721_tcf1-m3_filtered")
+pred_1IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_1IL12_102721_tcf1-m3_filtered")
+
+# add lin column
+lin_col <- sapply(strsplit(pred_0IL12$lin_tr, "_"), `[`, 1)
+pred_0IL12 <- pred_0IL12 %>% add_column(lin = lin_col, .before = "lin_tr" )
+lin_col <- sapply(strsplit(pred_1IL12$lin_tr, "_"), `[`, 1)
+pred_1IL12 <- pred_1IL12 %>% add_column(lin = lin_col, .before = "lin_tr" )
+
+
+df_pred <- rbind(pred_0IL12, pred_1IL12)
+
+plots <- df_pred %>% 
+  #group_by(pos, lin) %>%
+  group_by(cond) %>%
+  do(
+    plot = {
+      # p <- ggplot(., aes(t, tcf1.smooth, group = ID, color = cond)) +
+    p <- ggplot(., aes(t, tcf1.smooth/1000000, group = ID, color = factor(tcf1_fit_filtered))) +
+    #p <- ggplot(., aes(t, cd69, group = ID, color = factor(tcf1_fit_filtered))) +
+    #p <- ggplot(., aes(t, area, group = ID, color = factor(tcf1_fit_filtered))) +
+    geom_line( alpha = 0.2) +
+            scale_color_manual(name = "tcf1_fit_filtered",
+                     values = state_colors) +
+      ylim(0,6) +
+      labs(x = "Time (hrs)", y = expression(Intensity~(x ~10^{"6"}~a.u.))) +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.ticks.y=element_blank(),  axis.line = element_line(colour = "black"), text=element_text(size=24), legend.position = "none")
+    p
+  })
+
+# view
+#num <- nrow(distinct(df_pred, pos, lin))
+num <- nrow(distinct(df_pred, cond))
+for (p in seq(from=1, to=num)){
+  print(plots$plot[[p]])
+}
+
+save_plot(plots$plot[[1]], filename = '/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/5.Experiments_labwork/Analysis/20200129_CD8_KL_infl/R_output_figures_102721/track_overlay_states_0IL12.png', base_asp = 1)
+save_plot(plots$plot[[2]], filename = '/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/5.Experiments_labwork/Analysis/20200129_CD8_KL_infl/R_output_figures_102721/track_overlay_states_1IL12.png', base_asp = 1)
+
+```
+
+# Plot longtracks overlaid on single plot - CD69 or area
+Add capability to group tracks by different features
+```{r}
+state_colors = c("1" = "#000004FF", # viridis::inferno 5 color
+                                    "2" = "#56106EFF",
+                                    "3" = "#BB3754FF",
+                                  "4" = "#F98C0AFF")
+
+pred_0IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_0IL12_102721_tcf1-m3_filtered")
+pred_1IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_1IL12_102721_tcf1-m3_filtered")
+
+# add lin column
+lin_col <- sapply(strsplit(pred_0IL12$lin_tr, "_"), `[`, 1)
+pred_0IL12 <- pred_0IL12 %>% add_column(lin = lin_col, .before = "lin_tr" )
+lin_col <- sapply(strsplit(pred_1IL12$lin_tr, "_"), `[`, 1)
+pred_1IL12 <- pred_1IL12 %>% add_column(lin = lin_col, .before = "lin_tr" )
+
+df_pred <- rbind(pred_0IL12, pred_1IL12)
+
+plots <- df_pred %>% 
+  #group_by(pos, lin) %>%
+  group_by(cond) %>%
+  do(
+    plot = {
+    p <- ggplot(., aes(t, cd69, group = ID, color = factor(tcf1_fit_filtered))) +
+    #p <- ggplot(., aes(t, area, group = ID, color = factor(tcf1_fit_filtered))) +
+    geom_line( alpha = 0.2) +
+            scale_color_manual(name = "tcf1_fit_filtered",
+                     values = state_colors) +
+      ylim(0,3000) +
+      # labs(x = "Time (hrs)", y = "Intensity (a.u.)")  +
+      # labs(x = "Time (hrs)", y = expression(Area~( px^{"2"})))  +
+      labs(x = "", y = "")  +
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.ticks.y=element_blank(),  axis.line = element_line(colour = "black"), text=element_text(size=24), legend.position = "none")
+    p
+  })
+
+# view
+#num <- nrow(distinct(df_pred, pos, lin))
+num <- nrow(distinct(df_pred, cond))
+for (p in seq(from=1, to=num)){
+  print(plots$plot[[p]])
+}
+
+# area
+# save_plot(plots$plot[[1]], filename = '/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/5.Experiments_labwork/Analysis/20200129_CD8_KL_infl/R_output_figures_102721/track_overlay_states_0IL12_area.png', base_asp = 1.2)
+# save_plot(plots$plot[[2]], filename = '/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/5.Experiments_labwork/Analysis/20200129_CD8_KL_infl/R_output_figures_102721/track_overlay_states_1IL12_area.png', base_asp = 1.2)
+
+# cd69
+save_plot(plots$plot[[1]], filename = '/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/5.Experiments_labwork/Analysis/20200129_CD8_KL_infl/R_output_figures_102721/track_overlay_states_0IL12_cd69.png', base_asp = 1.2)
+save_plot(plots$plot[[2]], filename = '/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/5.Experiments_labwork/Analysis/20200129_CD8_KL_infl/R_output_figures_102721/track_overlay_states_1IL12_cd69.png', base_asp = 1.2)
+
+```
+
+
+
+
+# Calculate popuation division and regulatory event distributions
+# Also, add column to df that contains the lineage number only (not combined with longtrack number)
+```{r}
+## INPUT
+pred_0IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_0IL12_102721_tcf1-m3_filtered")
+pred_1IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_1IL12_102721_tcf1-m3_filtered")
+
+dur_thresh=10 # minimum duration of active or silent states to qualify as an act of silencing event
+
+# add lin column
+lin_col <- sapply(strsplit(pred_0IL12$lin_tr, "_"), `[`, 1)
+pred_0IL12 <- pred_0IL12 %>% add_column(lin = lin_col, .before = "lin_tr" )
+lin_col <- sapply(strsplit(pred_1IL12$lin_tr, "_"), `[`, 1)
+pred_1IL12 <- pred_1IL12 %>% add_column(lin = lin_col, .before = "lin_tr" )
+
+
+## FUNCTIONS
+
+# remove any lin that starts later than t = 10 hr
+remove_latestart_lins <- function(df, thresh){
+  df <- df %>% group_by(ID) %>% mutate(first_t = min(t)) %>% ungroup()
+  df <- df[df$first_t <thresh, ]
+  return(df)
+}
+
+# Calc total time in state 3 or 4 (ON)
+time_tcf1_on <- function(fit_col){
+  total_time <- sum(fit_col==3 | fit_col==4)*0.25 # this assumes each time step is 0.25 hr, which is not necessarily true
+  return(total_time)
+}
+
+# Calc total time in state 4 (ON high)
+time_tcf1_on_high <- function(fit_col){
+  total_time <- sum(fit_col==4)*0.25 # this assumes each time step is 0.25 hr, which is not necessarily true
+  return(total_time)
+}
+
+calc_t_div1 <- function(div_col, t_col){
+  index <- which(div_col == TRUE)[1]
+  t <- t_col[index]
+  return(t)
+}
+
+calc_first_state2 <- function(fit_col, t_col){
+  index <- which(fit_col == 2)[1]
+  t <- t_col[index]
+  return(t)
+}
+
+calc_first_state3_4 <- function(fit_col, t_col){
+  index <- which(fit_col == 3 | fit_col == 4)[1]
+  t <- t_col[index]
+  return(t)
+}
+
+calc_first_state4 <- function(fit_col, t_col){
+  index <- which(fit_col == 4)[1]
+  t <- t_col[index]
+  return(t)
+}
+
+calc_first_state3 <- function(fit_col, t_col){
+  index <- which(fit_col == 3)[1]
+  t <- t_col[index]
+  return(t)
+}
+
+calc_first_active <- function(fit_col, t_col, dur_thresh, on_states){
+  runs <- rle(fit_col)
+  run_lengths <- runs$lengths
+  run_state <- runs$values
+  # allow for multiple active states
+  if (any(on_states %in% run_state)){
+    ind <- which(run_state %in% on_states)
+    ind_c = 1 # index counter
+    while (ind_c <= length(ind)){
+      act_ind = ind[ind_c]
+      act_start_loc = sum(run_lengths[1:act_ind-1])+1 # location in fit_col of first  timepoint
+      act_end_loc = act_start_loc +run_lengths[act_ind]-1 # last  timepoint
+      state_dur = t_col[act_end_loc] - t_col[act_start_loc]
+      prev_state = run_state[act_ind-1]
+      # if the prev state is also on, sum it with this state duration
+      if (prev_state %in% on_states){
+        act_ind_prev = act_ind - 1
+        act_start_loc_prev = sum(run_lengths[1:act_ind_prev-1])+1 
+        act_end_loc_prev = act_start_loc_prev +run_lengths[act_ind_prev]-1 
+        state_dur_prev = t_col[act_end_loc_prev] - t_col[act_start_loc_prev]
+        state_dur = state_dur + state_dur_prev
+        act_start_loc = act_start_loc_prev}
+      if (state_dur > dur_thresh){
+          t_act = t_col[act_start_loc]
+        } else {t_act = NA}
+      # if first state is a true activation event, do not need to evaluate next state
+      if (!is.na(t_act)){break}
+      ind_c = ind_c + 1 }
+  } else {t_act = NA}
+  
+  return(t_act)
+      
+    }
+
+calc_first_silence <- function(fit_col, t_col, dur_thresh, sil_state, on_states){
+  runs <- rle(fit_col)
+  run_lengths <- runs$lengths
+  run_state <- runs$values
+  # allow for multiple silent states
+  if (sil_state %in% run_state){
+    ind <- which(run_state == sil_state)
+    ind_c = 1 # index counter
+    while (ind_c <= length(ind)){
+      sil_ind = ind[ind_c]
+      sil_start_loc = sum(run_lengths[1:sil_ind-1])+1 # location in fit_col of first silent timepoint
+      sil_end_loc = sil_start_loc +run_lengths[sil_ind]-1 # last silent timepoint
+      state_dur = t_col[sil_end_loc] - t_col[sil_start_loc]
+      prev_state = run_state[sil_ind-1]
+      if (prev_state %in% on_states){
+        if (state_dur > dur_thresh){
+          t_sil = t_col[sil_start_loc]
+        } else {t_sil = NA}
+      }
+      else {t_sil = NA}
+      # if first silent state is a true silencing event, do not need to evaluate next silent state
+      if (!is.na(t_sil)){break}
+      ind_c = ind_c + 1 }
+  } else {t_sil = NA}
+  
+  return(t_sil)
+      
+    }
+  
+  
+###
+
+# Run functions
+
+# Remove lineages that start later than 10 hrs
+pred_0IL12 <- remove_latestart_lins(pred_0IL12, 10)
+pred_1IL12 <- remove_latestart_lins(pred_1IL12, 10)
+
+# bind conditions into one df
+df_pred <- rbind(pred_0IL12, pred_1IL12)
+
+# calc total time in ON states
+df_pred <- df_pred %>% group_by(ID) %>% mutate(total_t_tcf1_ON = time_tcf1_on(tcf1_fit)) %>% ungroup()
+df_pred <- df_pred %>% group_by(ID) %>% mutate(total_t_tcf1_ON_high = time_tcf1_on_high(tcf1_fit)) %>% ungroup()
+
+# time of first division 
+df_pred <- df_pred %>% group_by(ID) %>% arrange(t) %>% mutate(t_div1 = calc_t_div1(divtimes, t)) %>% ungroup()
+
+# time of first tcf1 activation (either to high or low ON state) 
+df_pred <- df_pred %>% group_by(ID) %>% arrange(t) %>% mutate(t_tcf1_act = calc_first_active(tcf1_fit_filtered, t, dur_thresh=dur_thresh, on_states=c(3,4))) %>% ungroup()
+
+# time of first tcf1 silencing (either from high or low ON state) 
+df_pred <- df_pred %>% group_by(ID) %>% arrange(t) %>% mutate(t_tcf1_sil = calc_first_silence(tcf1_fit_filtered, t, dur_thresh=dur_thresh, sil_state=2, on_states=c(3,4))) %>% ungroup()
+
+# Calculate average cell cycle time per lineage 
+df_pred <- df_pred %>% group_by(ID, tr_num) %>% mutate(tr_cell_cycle_time = max(t) - min(t)) %>% ungroup()
+df_pred <- df_pred %>% group_by(ID) %>% mutate(lin_ave_cell_cycle = mean(tr_cell_cycle_time))
+
+# calculate average promoter activity per track
+df_pred <- df_pred %>% group_by(ID, tr_num) %>% mutate(tr_ave_tcf1.deriv = mean(tcf1.deriv)) %>% ungroup()
+
+# calculate average area per track (e.g. one cell cycle length)
+df_pred <- df_pred %>% group_by(ID, tr_num) %>% mutate(tr_ave_area = mean(area)) %>% ungroup()
+
+# time of first tcf1 activation relative to first div (either low or high state)
+t_tcf1_act_reldiv1 <- df_pred$t_tcf1_act - df_pred$t_div1
+df_pred <- df_pred %>% add_column(t_tcf1_act_reldiv1 = t_tcf1_act_reldiv1, .after = "t_tcf1_act")
+
+saveRDS(df_pred, file = "/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/df_pred_102721_tcf1-m3_filtered_added-stats.RDS")
+  
+```
+
+# Plot events above but using histograms 
+```{r}
+## Plot
+bw = 4 # binwidth
+output_folder = '/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/5.Experiments_labwork/Analysis/20200129_CD8_KL_infl/R_output_figures_102721'
+
+gg_theme =   theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(),axis.line = element_line(colour = "black"), legend.position = "none", text=element_text(size=24))
+
+order  = c("1IL12", "0IL12")
+
+# plot t_div1
+g1 <- df_pred %>% 
+  filter(cond == '1IL12') %>%
+  melt(., id.vars = c("ID", "cond", "pos"), measure.vars = c("t_div1")) %>%
+  distinct(pos, variable, value, .keep_all = TRUE) %>%
+  mutate(cond = factor(cond, levels = order)) %>%
+  ggplot(aes(x=value, fill = cond, color = cond)) +
+  geom_histogram(aes(y=..density..), alpha = 0.6, position = 'identity', binwidth = bw) +
+  xlab("Time (hrs)") + ylab("") +
+  xlim(0,80) +
+  scale_color_manual(values = c('black')) +
+  scale_fill_manual(values = c('grey')) +
+  # facet_grid(cond ~ ., scales = "fixed")+
+  gg_theme
+
+# plot time of TCF1 activation (include both low and high promoter states)
+g2 <- df_pred %>% 
+  filter(cond == '1IL12') %>%
+  melt(., id.vars = c("ID", "cond", "pos"), measure.vars = c("t_tcf1_act")) %>%
+  distinct(pos, variable, value, .keep_all = TRUE) %>%
+  mutate(cond = factor(cond, levels = order)) %>%
+  ggplot(aes(x=value, fill = cond, color = cond)) +
+  geom_histogram(aes(y=..density..),alpha = 0.6, position = 'identity', binwidth = bw)+
+  #geom_density(alpha = 0.6, position = 'identity', binwidth = 5)+
+  xlab("Time (hrs)") + ylab("") +
+  xlim(0,80) +
+  scale_color_manual(values = c('black')) +
+  scale_fill_manual(values = c('grey')) +
+  #facet_grid(cond ~ ., scales = "fixed")+
+  gg_theme
+
+# plot time of TCF1 activation relative to first div (include both low and high promoter states)
+g2.1 <- df_pred %>% 
+  filter(cond == '1IL12') %>%
+  melt(., id.vars = c("ID", "cond", "pos"), measure.vars = c("t_tcf1_act_reldiv1")) %>%
+  distinct(pos, variable, value, .keep_all = TRUE) %>%
+  mutate(cond = factor(cond, levels = order)) %>%
+  ggplot(aes(x=value, fill = cond, color = cond)) +
+  geom_histogram(aes(y=..density..),alpha = 0.6, position = 'identity', binwidth = bw)+
+  #geom_density(alpha = 0.6, position = 'identity', binwidth = 5)+
+  xlab("Time (hrs)") + ylab("") +
+  scale_color_manual(values = c('black')) +
+  scale_fill_manual(values = c('grey')) +
+  #facet_grid(cond ~ ., scales = "fixed")+
+  gg_theme
+
+
+# plot TCF1 silencing time
+g4 <- df_pred %>%
+  filter(cond == '1IL12') %>%
+  melt(., id.vars = c("ID", "cond", "pos"), measure.vars = c("t_tcf1_sil")) %>%
+  distinct(pos, variable, value, .keep_all = TRUE) %>%
+  mutate(cond = factor(cond, levels = order)) %>%
+  ggplot(aes(x=value, fill = cond, color = cond)) +
+  geom_histogram(aes(y=..density..),alpha = 0.6, position = 'identity', binwidth = bw)+
+  #geom_density(alpha = 0.6, position = 'identity', binwidth = 5)+
+  xlab("Time (hrs)") + ylab("") +
+  xlim(0,80) +
+  scale_color_manual(values = c('black')) +
+  scale_fill_manual(values = c('grey')) +
+  #facet_grid(cond ~ ., scales = "fixed")+
+  gg_theme
+
+# plot total TCF1 ON time 
+g6 <- df_pred %>%
+  filter(cond == '1IL12') %>%
+  # filter(t_tcf1_sil > t_tcf1_act) %>%
+  melt(., id.vars = c("ID", "cond", "pos"), measure.vars = c("total_t_tcf1_ON")) %>%
+  distinct(pos, variable, value, .keep_all = TRUE) %>%
+  mutate(cond = factor(cond, levels = order)) %>%
+  ggplot(aes(x=value, fill = cond, color = cond)) +
+  geom_histogram(aes(y=..density..),alpha = 0.6, position = 'identity', binwidth = bw)+
+  # geom_density(alpha = 0.6, position = 'identity', binwidth = 5)+
+  xlab("Duration (hrs)") + ylab("") +
+  xlim(0,80) +
+  scale_color_manual(values = c('black')) +
+  scale_fill_manual(values = c('grey')) +
+  #facet_grid(cond ~ ., scales = "fixed")+
+  gg_theme
+
+# plot total TCF1 ON high time 
+g7 <- df_pred %>%
+  filter(cond == '1IL12') %>%
+  # filter(t_tcf1_sil > t_tcf1_act) %>%
+  melt(., id.vars = c("ID", "cond", "pos"), measure.vars = c("total_t_tcf1_ON_high")) %>%
+  distinct(pos, variable, value, .keep_all = TRUE) %>%
+  mutate(cond = factor(cond, levels = order)) %>%
+  ggplot(aes(x=value, fill = cond, color = cond)) +
+  geom_histogram(aes(y=..density..),alpha = 0.6, position = 'identity', binwidth = bw)+
+  #geom_density(alpha = 0.6, position = 'identity', binwidth = 5)+
+  xlab("Duration (hrs)") + ylab("") +
+  xlim(0,80) +
+  scale_color_manual(values = c('black')) +
+  scale_fill_manual(values = c('grey')) +
+  #facet_grid(cond ~ ., scales = "fixed")+
+  gg_theme
+
+g1
+g2
+g2.1
+g4
+g6
+g7
+
+
+save_plot(g1, filename = file.path(output_folder, "t_div1.pdf"), base_asp = 1.2)
+save_plot(g2, filename = file.path(output_folder, "t_tcf1_act.pdf"), base_asp = 1.2)
+save_plot(g2.1, filename = file.path(output_folder, "t_tcf1_act_rel-div1.pdf"), base_asp = 1.2)
+save_plot(g4, filename = file.path(output_folder, "t_tcf1_sil.pdf"), base_asp = 1.2)
+save_plot(g6, filename = file.path(output_folder, "total_t_tcf1_act.pdf"), base_asp = 1.2)
+save_plot(g7, filename = file.path(output_folder, "total_t_tcf1_HI_act.pdf"), base_asp = 1.2)
+
+```
+
+# Statistical tests on above +/- IL-12 distributions 
+```{r}
+
+# t_div1
+df_pred_0IL12 <-  df_pred %>%
+  dplyr::filter(cond == '0IL12') %>%
+  melt(., id.vars = c("ID", "cond", "pos"), measure.vars = c("t_div1")) %>%
+  distinct(pos, variable, value, .keep_all = TRUE) 
+df_pred_1IL12 <-  df_pred %>%
+  dplyr::filter(cond == '1IL12') %>%
+  melt(., id.vars = c("ID", "cond", "pos"), measure.vars = c("t_div1")) %>%
+  distinct(pos, variable, value, .keep_all = TRUE) 
+wilcox_t_div1 <- wilcox.test(df_pred_0IL12$value, df_pred_1IL12$value)
+
+# t_tcf1_act_reldiv1
+df_pred_0IL12 <-  df_pred %>%
+  dplyr::filter(cond == '0IL12') %>%
+  melt(., id.vars = c("ID", "cond", "pos"), measure.vars = c("t_tcf1_act_reldiv1")) %>%
+  distinct(pos, variable, value, .keep_all = TRUE) 
+df_pred_1IL12 <-  df_pred %>%
+  dplyr::filter(cond == '1IL12') %>%
+  melt(., id.vars = c("ID", "cond", "pos"), measure.vars = c("t_tcf1_act_reldiv1")) %>%
+  distinct(pos, variable, value, .keep_all = TRUE) 
+wilcox_t_tcf1_act_reldiv1 <- wilcox.test(df_pred_0IL12$value, df_pred_1IL12$value)
+
+# total_t_tcf1_ON
+df_pred_0IL12 <-  df_pred %>%
+  dplyr::filter(cond == '0IL12') %>%
+  melt(., id.vars = c("ID", "cond", "pos"), measure.vars = c("total_t_tcf1_ON")) %>%
+  distinct(pos, variable, value, .keep_all = TRUE) 
+df_pred_1IL12 <-  df_pred %>%
+  dplyr::filter(cond == '1IL12') %>%
+  melt(., id.vars = c("ID", "cond", "pos"), measure.vars = c("total_t_tcf1_ON")) %>%
+  distinct(pos, variable, value, .keep_all = TRUE) 
+wilcox_total_t_tcf1_ON <- wilcox.test(df_pred_0IL12$value, df_pred_1IL12$value)
+
+# total_t_tcf1_ON_high
+df_pred_0IL12 <-  df_pred %>%
+  dplyr::filter(cond == '0IL12') %>%
+  melt(., id.vars = c("ID", "cond", "pos"), measure.vars = c("total_t_tcf1_ON_high")) %>%
+  distinct(pos, variable, value, .keep_all = TRUE) 
+df_pred_1IL12 <-  df_pred %>%
+  dplyr::filter(cond == '1IL12') %>%
+  melt(., id.vars = c("ID", "cond", "pos"), measure.vars = c("total_t_tcf1_ON_high")) %>%
+  distinct(pos, variable, value, .keep_all = TRUE) 
+wilcox_total_t_tcf1_ON_high <- wilcox.test(df_pred_0IL12$value, df_pred_1IL12$value)
+
+# display 
+p_values <- c(wilcox_t_div1$p.value, wilcox_t_tcf1_act_reldiv1$p.value, wilcox_total_t_tcf1_ON$p.value, wilcox_total_t_tcf1_ON_high$p.value)
+value <- c('t_div1', 't_tcf1_act_reldiv1', 't_tcf1_ON', 't_tcf1_ON_high')
+data.frame(value, p_values)
+
+```
+
+
+# Plot promoter activities in each state, for both +/- IL-12 
+```{r}
+
+bw = 1
+# xlabel = expression(Derivative~(x ~10^{"3"}~a.u.))
+xlabel = ""
+ylabel = ""
+order  = c("1IL12", "0IL12")
+
+g_state1 <- rbind(pred_0IL12, pred_1IL12) %>% 
+  filter(tcf1_fit_filtered == 1) %>%
+  mutate(cond = factor(cond, levels = order)) %>%
+    ggplot(aes(x=tcf1.deriv/1000, fill = cond)) +
+  geom_histogram(alpha = 0.6, position = 'identity', binwidth = bw)+
+  facet_grid(cond ~ ., scales = "fixed")+
+  labs(x=xlabel, y=ylabel)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(),axis.line = element_line(colour = "black"), text=element_text(size=16))
+
+g_state2 <- rbind(pred_0IL12, pred_1IL12) %>% 
+  filter(tcf1_fit_filtered == 2) %>%
+  mutate(cond = factor(cond, levels = order)) %>%
+    ggplot(aes(x=tcf1.deriv/1000, fill = cond)) +
+  geom_histogram(alpha = 0.6, position = 'identity', binwidth =  bw)+
+  facet_grid(cond ~ ., scales = "fixed")+
+  labs(x=xlabel, y=ylabel)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(),axis.line = element_line(colour = "black"), text=element_text(size=16))
+
+g_state3 <- rbind(pred_0IL12, pred_1IL12) %>% 
+  filter(tcf1_fit_filtered == 3) %>%
+  mutate(cond = factor(cond, levels = order)) %>%
+    ggplot(aes(x=tcf1.deriv/1000, fill = cond)) +
+  geom_histogram(alpha = 0.6, position = 'identity', binwidth = bw)+
+  facet_grid(cond ~ ., scales = "fixed")+
+  labs(x=xlabel, y=ylabel)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(),axis.line = element_line(colour = "black"), text=element_text(size=16))
+
+g_state4 <- rbind(pred_0IL12, pred_1IL12) %>% 
+  #distinct(ID, .keep_all = TRUE) %>%
+  filter(tcf1_fit_filtered == 4) %>%
+  #filter(cond == '0IL12') %>%
+  # ggplot(aes(x=tcf1.deriv, fill = cond)) +
+  mutate(cond = factor(cond, levels = order)) %>%
+    ggplot(aes(x=tcf1.deriv/1000, fill = cond)) +
+  geom_histogram(alpha = 0.6, position = 'identity', binwidth =  bw)+
+  facet_grid(cond ~ ., scales = "fixed")+
+  labs(x=xlabel, y=ylabel)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(),axis.line = element_line(colour = "black"), text=element_text(size=16))
+
+g_state1
+g_state2
+g_state3
+g_state4
+
+# save
+save_plot(g_state1, filename = file.path(output_folder, "activity_hist_state1.pdf"), base_asp = 1.2)
+save_plot(g_state2, filename = file.path(output_folder, "activity_hist_state2.pdf"), base_asp = 1.2)
+save_plot(g_state3, filename = file.path(output_folder, "activity_hist_state3.pdf"), base_asp = 1.2)
+save_plot(g_state4, filename = file.path(output_folder, "activity_hist_state4.pdf"), base_asp = 1.2)
+```
+
+# Plot distributions of each states, including theoretical state distributions
+```{r}
+
+# x axis is ^3
+
+df <- pred_0IL12
+g_all_0IL12 <- df %>%
+  mutate(tcf1_fit_filtered = factor(tcf1_fit_filtered)) %>%
+  # experimental distributions
+  ggplot() +
+  geom_density(aes(x=tcf1.deriv/1000, fill = tcf1_fit_filtered), alpha = 0.8, position = 'identity', color = NA)+
+  scale_fill_manual(name = "tcf1_fit_filtered",
+                     values = state_colors)+
+  # theoretical distribution
+  stat_function(aes(x=tcf1.deriv/1000), fun = dnorm, n = 101, args = list(mean = -15042.79/1000, sd= 11007.98/1000), color = state_colors[1]) +
+  stat_function(aes(x=tcf1.deriv/1000), fun = dnorm, n = 101, args = list(mean = 5544.265/1000, sd= 8286.387/1000), color = state_colors[2]) +
+  stat_function(aes(x=tcf1.deriv/1000), fun = dnorm, n = 101, args = list(mean = 27665.118/1000, sd= 6729.124/1000), color = state_colors[3]) +
+  stat_function(aes(x=tcf1.deriv/1000), fun = dnorm, n = 101, args = list(mean = 64391.54/1000, sd= 28295.92/1000), color = state_colors[4]) +
+  labs(x="", y="")+
+  gg_theme
+
+df <- pred_1IL12
+g_all_1IL12 <- df %>%
+  mutate(tcf1_fit_filtered = factor(tcf1_fit_filtered)) %>%
+  # experimental distributions
+  ggplot() +
+  geom_density(aes(x=tcf1.deriv/1000, fill = tcf1_fit_filtered), alpha = 0.8, position = 'identity', color = NA)+
+  scale_fill_manual(name = "tcf1_fit_filtered",
+                     values = state_colors)+
+  # theoretical distribution
+  stat_function(aes(x=tcf1.deriv/1000), fun = dnorm, n = 101, args = list(mean = -15042.79/1000, sd= 11007.98/1000), color = state_colors[1]) +
+  stat_function(aes(x=tcf1.deriv/1000), fun = dnorm, n = 101, args = list(mean = 5544.265/1000, sd= 8286.387/1000), color = state_colors[2]) +
+  stat_function(aes(x=tcf1.deriv/1000), fun = dnorm, n = 101, args = list(mean = 27665.118/1000, sd= 6729.124/1000), color = state_colors[3]) +
+  stat_function(aes(x=tcf1.deriv/1000), fun = dnorm, n = 101, args = list(mean = 64391.54/1000, sd= 28295.92/1000), color = state_colors[4]) +
+  labs(x="", y="")+
+  gg_theme
+
+
+save_plot(g_all_0IL12, filename = file.path(output_folder, "state_dist_0IL12.pdf"), base_asp = 1.2)
+save_plot(g_all_1IL12, filename = file.path(output_folder, "state_dist_1IL12.pdf"), base_asp = 1.2)
+
+```
+
+# Sister sister plots and parent daughter plots
+2D plots of promoter activity and intensity for sisters and for parents-daughters and for random cells
+```{r}
+
+
+# FUNCTION to add columns to df_pred_divtimes with active times for child 1 and child 2
+  assign_child_ave_tcf1_deriv <- function(df_pred, child_col, pos_col){
+    if (child_col != 0){
+      df_pred <- df_pred %>% filter(pos == pos_col)
+      if (child_col %in% df_pred$tr_num){
+        child_ave_tcf1_deriv <- ((df_pred[which(df_pred['tr_num'] == as.numeric(child_col)),]) %>% distinct(tr_num, .keep_all = TRUE))$tr_ave_tcf1.deriv
+      }
+      else{child_ave_tcf1_deriv <- NA } # this is a case where a child ends immediately after assignment 
+    }
+    else{child_ave_tcf1_deriv <- NA }
+    return(child_ave_tcf1_deriv)
+  }
+
+# FUNCTION TO make 2D plots
+plot_pairs <- function(pair_df,  x_col, y_col, xlabel, ylabel,s1_mu, s1_s, s2_mu, s2_s, s3_mu, s3_s, s4_mu, s4_s){
+  arg <- match.call()
+  p <- pair_df %>% 
+  ggplot(aes(x=eval(arg$x_col), y = eval(arg$y_col))) +
+  geom_point(alpha = 0.6)+
+    stat_cor(aes(label=..r.label..), size = 10) +
+  geom_smooth(method=lm, se=FALSE) +
+    geom_vline(xintercept = s3_mu - s3_s) +  geom_hline(yintercept = s3_mu - s3_s) +
+    xlab(xlabel) + ylab(ylabel) +
+    coord_fixed() +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(),axis.line = element_line(colour = "black"), text=element_text(size=28))
+ return(p) 
+}
+
+# load df_pred that is combined 0IL12 and 1IL12 dfs; removed lins starting later than 10hrs; added additional stats such as regulatory event timing and sums of active times 
+df_pred <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/df_pred_102721_tcf1-m3_filtered_added-stats.RDS")
+# df_pred <- df_pred %>% filter(tr_cell_cycle_time >= 5) # remove rows with cell cycle less than 5 hr
+
+## RUN For sister-sister analysis
+
+# create df of distinct sister sister pairs
+s_pairs <- df_pred %>% distinct(pos, child_1, child_2, .keep_all=TRUE)
+
+# go through each sister pair and get the promoter state for each corresponding child_1 and child_2
+s_pairs <-s_pairs %>% rowwise() %>% mutate(child_1_ave_tcf1_deriv = assign_child_ave_tcf1_deriv(df_pred, child_1, pos))
+s_pairs <-s_pairs %>% rowwise() %>% mutate(child_2_ave_tcf1_deriv = assign_child_ave_tcf1_deriv(df_pred, child_2, pos))
+
+# make 2D plot for sister sister pairs
+sisters <- plot_pairs(s_pairs, x_col=child_1_ave_tcf1_deriv, y_col=child_2_ave_tcf1_deriv, 'Sister 1', 'Sister 2', -15042.79, 11007.98, 5544.265, 8286.387, 27665.118, 6729.124, 64391.54, 28295.92)
+
+# make 2D plot for random pairs
+rand_1 <- s_pairs[sample(nrow(s_pairs)), ]
+rand_2 <- s_pairs[sample(nrow(s_pairs)), ]
+s_pairs_rand <- cbind(rand_1 %>% dplyr::select(child_1, child_1_ave_tcf1_deriv), rand_2 %>% dplyr::select(child_2, child_2_ave_tcf1_deriv))
+sisters_rand <- plot_pairs(s_pairs_rand, x_col=child_1_ave_tcf1_deriv, y_col=child_2_ave_tcf1_deriv, 'Random cell 1', 'Random cell 2', -15042.79, 11007.98, 5544.265, 8286.387, 27665.118, 6729.124, 64391.54, 28295.92)
+
+# display and save
+sisters
+sisters_rand
+save_plot(sisters, file =  file.path(output_folder, 'sisters_ave_tcf1_deriv.pdf'))
+save_plot(sisters_rand, file = file.path(output_folder, 'rand_ave_tcf1_deriv.pdf'))
+
+## RUN For parent-daughter analysis
+
+# create df of distinct sister sister pairs
+pd_pairs <- df_pred %>% distinct(pos, tr_num, child_1, child_2, .keep_all=TRUE)
+
+# go through each sister pair and get the promoter state for each corresponding child_1 and child_2
+pd_pairs <-pd_pairs %>% rowwise() %>% mutate(child_1_ave_tcf1_deriv = assign_child_ave_tcf1_deriv(df_pred, child_1, pos))
+pd_pairs <-pd_pairs %>% rowwise() %>% mutate(child_2_ave_tcf1_deriv = assign_child_ave_tcf1_deriv(df_pred, child_2, pos))
+
+# make 2D plot for sister sister pairs
+parent_c1 <- plot_pairs(pd_pairs, x_col=tr_ave_tcf1.deriv, y_col=child_1_ave_tcf1_deriv, 'Parent', 'Child 1', -15042.79, 11007.98, 5544.265, 8286.387, 27665.118, 6729.124, 64391.54, 28295.92)
+parent_c2 <- plot_pairs(pd_pairs, x_col=tr_ave_tcf1.deriv, y_col=child_2_ave_tcf1_deriv, 'Parent', 'Child 2', -15042.79, 11007.98, 5544.265, 8286.387, 27665.118, 6729.124, 64391.54, 28295.92)
+
+
+# display and save
+parent_c1
+parent_c2
+save_plot(parent_c1, file = file.path(output_folder, 'parent_child1_ave_tcf1_deriv.pdf'))
+save_plot(parent_c2, file = file.path(output_folder, 'parent_child2_ave_tcf1_deriv.pdf'))
+
+```
+
+# 2D plots of extracted parameters by longtrack 
+```{r}
+
+# tcf1 derivative is 10^3
+
+# calculate average promoter activity, cd69, area per longtrack
+df_pred <- df_pred %>% 
+  group_by(ID) %>% 
+  mutate(ID_ave_tcf1.deriv = mean(tcf1.deriv)) %>% 
+  mutate(ID_ave_cd69 = mean(cd69)) %>% 
+  mutate(ID_ave_area = mean(area)) %>% 
+  ungroup()
+
+# First remove average cd69 outliers 
+df_pred_ol <- df_pred %>% distinct(ID, .keep_all = TRUE)
+mod <- lm(ID_ave_cd69 ~ ID_ave_tcf1.deriv, data = df_pred_ol)
+cooksd <- cooks.distance(mod)
+sample_size <- nrow(df_pred_ol)
+
+plot(cooksd, pch="*", cex=2, main="Influential Obs by Cooks distance")  # plot cook's distance
+abline(h = 4/sample_size, col="red")  # add cutoff line
+text(x=1:length(cooksd)+1, y=cooksd, labels=ifelse(cooksd>4/sample_size, names(cooksd),""), col="red")  # add labels
+
+top_x_outlier <- 3
+influential <- as.numeric(names(sort(cooksd, decreasing = TRUE)[1:top_x_outlier]))
+df_pred_ol <- df_pred_ol[-influential,]
+
+# plot
+g2D_tr_area <- df_pred %>% 
+  distinct(ID, .keep_all = TRUE) %>%
+  ggplot(aes(x=ID_ave_area, y = ID_ave_tcf1.deriv/1000)) +
+  geom_point(alpha = 0.6)+
+  geom_smooth(method=lm, se=FALSE) +
+  stat_cor(aes(label=..r.label..), size = 10) +
+  xlab("") + ylab("")+
+  gg_theme
+
+g2D_tr_cd69 <- df_pred_ol %>% 
+  distinct(ID, tr_num, .keep_all = TRUE) %>%
+  ggplot(aes(x=ID_ave_cd69, y = ID_ave_tcf1.deriv/1000)) +
+  geom_point(alpha = 0.6)+
+  geom_smooth(method=lm, se=FALSE) +
+  stat_cor(aes(label=..r.label..), size = 10) +
+  xlab("") + ylab("")+
+  gg_theme
+
+g2D_tr_area
+g2D_tr_cd69
+
+save_plot(g2D_tr_area, filename = file.path(output_folder, "g2D_tr_area.pdf"), base_asp = 1.2)
+save_plot(g2D_tr_cd69, filename = file.path(output_folder, "g2D_tr_cd69.pdf"), base_asp = 1.2)
+
+
+```
+
+
+
+## Downstream analysis of predicted states
+# Functions 
+```{r}
+################################################################################################################################################
+# add theoretical time for each row in df
+add_t_theor <- function(df_pred, t_theor){
+  
+  get_t_theor <- function(x,t_theor){
+    t_match <- t_theor[which.min(abs(t_theor - as.numeric(x['t'])))]
+    return(t_match)
+  }
+  df_pred$t_theor <- apply(df_pred, 1, FUN=function(x) get_t_theor(x,t_theor) )
+  return(df_pred)
+}
+
+################################################################################################################################################
+# at each theoretical time point, count number of total cells and fraction of cells in each promoter state - output df_summary with this information
+count_states <- function(df_pred){
+  
+  # make a new summary df containing all unique t_theor
+  t_uni <- unique(df_pred$t_theor)
+  df_summary <- data.frame(t_theor = t_uni)
+  
+  # for every row of df_summary (e.g. every unique time point), count number of cells that have that time point
+  count_t_theor <- function(x, df_compare){ # x is a row of df 
+    count <- sum(x['t_theor'] == df_compare['t_theor'])
+    return(count)
+  }
+  df_summary$total_cells <- apply(df_summary, 1, FUN = function(x) count_t_theor(x, df_pred))
+  
+  # ... count number of cells in each tcf1 and tbet state 
+  count_t_theor_state <- function(x, df_compare, channel, state){
+    count <- sum(x['t_theor'] == df_compare['t_theor'] & df_compare[paste(channel,"_fit_filtered",sep="")] == state )
+    return(count)
+  }
+
+  df_summary$tcf1_S1 <- apply(df_summary, 1, FUN = function(x) count_t_theor_state(x, df_pred, "tcf1", 1))
+  df_summary$tcf1_S2 <- apply(df_summary, 1, FUN = function(x) count_t_theor_state(x, df_pred, "tcf1", 2))  
+  df_summary$tcf1_S3 <- apply(df_summary, 1, FUN = function(x) count_t_theor_state(x, df_pred, "tcf1", 3))  
+  df_summary$tcf1_S4 <- apply(df_summary, 1, FUN = function(x) count_t_theor_state(x, df_pred, "tcf1", 4))  
+  
+  # compute fractions for each state
+  # in 4/24 model, TCF1 S1 and S2 are both OFF
+  df_summary$tcf1_frac_S1 <- df_summary$tcf1_S1/(df_summary$tcf1_S1+df_summary$tcf1_S2+df_summary$tcf1_S3+df_summary$tcf1_S4)
+  df_summary$tcf1_frac_S2 <- df_summary$tcf1_S2/(df_summary$tcf1_S1+df_summary$tcf1_S2+df_summary$tcf1_S3+df_summary$tcf1_S4)
+  df_summary$tcf1_frac_S3 <- df_summary$tcf1_S3/(df_summary$tcf1_S1+df_summary$tcf1_S2+df_summary$tcf1_S3+df_summary$tcf1_S4)
+  df_summary$tcf1_frac_S4 <- df_summary$tcf1_S4/(df_summary$tcf1_S1+df_summary$tcf1_S2+df_summary$tcf1_S3+df_summary$tcf1_S4)
+  
+  return(df_summary)
+}
+
+################################################################################################################################################
+# input df_summary and output two ggplot objects plotting fractions and cell numbers at each theoretical timepoint
+plot_promoter_fractions <- function(df_summary, cond){
+  # # plot fractions ON over time
+  df_summary_melt <- melt(df_summary[df_summary$total_cells>=5,], id.vars = "t_theor", measure.vars = c("tcf1_frac_S3", "tcf1_frac_S4")) # only plot for time points with >= 5 total cells
+  
+  df_summary_sum_ON <- df_summary %>% mutate(tcf1_frac_ON_sum = tcf1_frac_S3 + tcf1_frac_S4) 
+  df_summary_sum_ON_melt <-melt(df_summary_sum_ON[df_summary_sum_ON$total_cells>=5,], id.vars = "t_theor", measure.vars = c("tcf1_frac_ON_sum"))
+  df_summary_all_ON <- rbind(df_summary_melt, df_summary_sum_ON_melt)
+  print(head(df_summary_all_ON))
+
+  #  tcf1 
+  g_frac <- ggplot(data = df_summary_melt, aes(x=t_theor, y=value, color=variable)) +geom_line(size = 1) + xlim(0,75) + ylim(0,1)+
+    scale_color_manual(labels=c("TCF1 ON low", "TCF1 ON high"), values=c("yellow4", "darkgoldenrod2")) + xlab("time") + ylab("fraction of cells") +theme(legend.position="right") +ggtitle(cond) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_rect(fill = "transparent",colour = NA), plot.background = element_rect(fill = "transparent",colour = NA), axis.line = element_line(colour = "black"), text=element_text(size=18), legend.title=element_blank())
+  
+  # sum on states
+  g_frac_sum <- ggplot(data = df_summary_sum_ON_melt, aes(x=t_theor, y=value, color=variable)) +geom_line(size = 1) + xlim(0,75) + ylim(0,1)+
+    scale_color_manual(labels=c("TCF1 ON"), values=c("darkgoldenrod2")) + xlab("time") + ylab("fraction of cells") +theme(legend.position="right") +ggtitle(cond) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_rect(fill = "transparent",colour = NA), plot.background = element_rect(fill = "transparent",colour = NA), axis.line = element_line(colour = "black"), text=element_text(size=18), legend.title=element_blank())
+  
+  # plot each ON state and sum on same plot 
+  g_all_ON <- ggplot(data = df_summary_all_ON, aes(x=t_theor, y=value, color=variable)) +geom_line(size = 1) + xlim(0,75) + ylim(0,1)+
+    scale_color_manual(labels=c("low", "high", "total on"), values=c("#F7931E", "#FF0000", "darkgoldenrod2")) + xlab("time") + ylab("fraction of cells") +theme(legend.position="right") +ggtitle(cond) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_rect(fill = "transparent",colour = NA), plot.background = element_rect(fill = "transparent",colour = NA), axis.line = element_line(colour = "black"), text=element_text(size=18), legend.title=element_blank())
+  
+  
+  
+  # also plot number of cells total at each timepoint
+  g_cells <- ggplot(data = df_summary, aes(x=t_theor, y = total_cells)) + geom_line() + xlab("time") + ylab('number of cells') +ggtitle(cond) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(), axis.line = element_line(colour = "black"), text=element_text(size=18)) 
+  
+  
+  return(list(g_frac, g_frac_sum, g_all_ON, g_cells))
+}
+
+
+```
+
+# USER INPUT
+```{r}
+# Load RDS of predicted promoter states
+pred_0IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_0IL12_102721_tcf1-m3_filtered")
+pred_1IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_1IL12_102721_tcf1-m3_filtered")
+
+```
+
+
+# Plot promoter on fractions at population level
+```{r}
+gg_theme = theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(),axis.line = element_line(colour = "black"), legend.position ="none",axis.text = element_text(size = 18), text=element_text(size=24))
+
+cond_colors <- c("black","#00BFC4")
+
+# 0 IL12
+cond = "0IL12"
+df_pred <- pred_0IL12
+df_pred <- df_pred %>% distinct(pos,t,tr_num, .keep_all = TRUE) # filter for multiple progenitors
+t_theor <- seq(from=0, to=100, by=0.25) # Generate theoretical time vector
+df_pred <- add_t_theor(df_pred, t_theor) # add column to df that has the closest theoretical time for the t in that row
+df_summary_0IL12 <- count_states(df_pred) %>% mutate(tcf1_frac_ON_sum = tcf1_frac_S3 + tcf1_frac_S4, cond = cond)
+plot_output <- plot_promoter_fractions(df_summary_0IL12, cond)
+#plots
+
+# 01 IL12
+cond = "1IL12"
+df_pred <- pred_1IL12
+df_pred <- df_pred %>% distinct(pos,t,tr_num, .keep_all = TRUE) # filter for multiple progenitors
+t_theor <- seq(from=0, to=100, by=0.25) # Generate theoretical time vector
+df_pred <- add_t_theor(df_pred, t_theor) # add column to df that has the closest theoretical time for the t in that row
+df_summary_1IL12 <- count_states(df_pred) %>% mutate(tcf1_frac_ON_sum = tcf1_frac_S3 + tcf1_frac_S4, cond = cond)
+plot_output <- plot_promoter_fractions(df_summary_1IL12, cond)
+
+
+# comb
+df_summary_comb <- rbind(df_summary_1IL12, df_summary_0IL12)
+
+g_ON <- df_summary_comb %>% 
+  ggplot(aes(x=t_theor, y = tcf1_frac_ON_sum, color = factor(cond, levels = c("1IL12","0IL12")))) + 
+  geom_point() + 
+  scale_color_manual("", values = cond_colors) +
+  xlim(0,70)+
+  xlab('Time (hr)') + ylab("Fraction active") +
+  gg_theme 
+
+g_HI <- df_summary_comb %>% 
+  ggplot(aes(x=t_theor, y = tcf1_frac_S4, color = factor(cond, levels = c("1IL12","0IL12")))) + 
+  geom_point() + 
+  xlab('Time (hr)') + ylab("Fraction HI ON") +
+  gg_theme 
+
+g_LO <- df_summary_comb %>% 
+  ggplot(aes(x=t_theor, y = tcf1_frac_S3, color = factor(cond, levels = c("1IL12","0IL12")))) + 
+  geom_point() + 
+  xlab('Time (hr)') + ylab("Fraction LOW ON") +
+  gg_theme 
+
+g_SIL <- df_summary_comb %>% 
+  ggplot(aes(x=t_theor, y = tcf1_frac_S2, color = factor(cond, levels = c("1IL12","0IL12")))) + 
+  geom_point() + 
+  xlab('Time (hr)') + ylab("Fraction silenced") +
+  gg_theme 
+
+g_ON
+g_HI
+g_LO
+g_SIL
+
+save_plot(g_ON, filename = file.path(output_folder, "fraction_ON.pdf"), base_asp=1.2)
+
+
+```
+
+
+
+
+# Parent - daughter silencing analysis
+Version 2: here I am incorporating promoter states beyond a single cell cycle and also quantifying re-activation
+```{r}
+parent_daughter_relate <- function(df_pred, t_cellcycle_thresh, state_dur_thresh){
+  
+
+    
+  # calculate total cell cycle time and add to df_pred
+  time_summary <- df_pred %>% group_by(pos, tr_num) %>% summarise(total_t_cellcycle = max(t)-min(t)) %>% mutate(pos_tr_num = paste(pos, tr_num, sep="_"), .after= tr_num)
+  df_pred <- df_pred %>% mutate(pos_tr_num = paste(pos, tr_num, sep="_"), .after= tr_num) # add pos_tr_num ID to df_pred
+  df_pred$total_t_cellcycle <- time_summary[match(df_pred$pos_tr_num, time_summary$pos_tr_num), ]$total_t_cellcycle 
+  
+  # Go through every unique pos and track number and check activity state of parent and all children at end of cell cycle; also check cell cycle length
+  end_state_sum <- df_pred %>% group_by(ID, cond, pos, longtrack, tr_num, gen, child_1, child_2, total_t_cellcycle) %>% summarise(max_t = max(t), end_state = tcf1_fit_filtered[which(t==max(t))]) %>% ungroup()
+  
+  # function to calculate state duration and state start time; modify to also calculate cumulative time in negative promoter activity 
+  state_duration <- function(df_pred, tr_ID, max_t){
+    df_pred <- df_pred %>% filter(ID == tr_ID)
+    fit_col <- df_pred$tcf1_fit_filtered
+    t_col <- df_pred$t
+    tcf1_deriv <- df_pred$tcf1.deriv
+    runs <- rle(fit_col)
+    run_lengths <- runs$lengths
+    run_state <- runs$values
+    for (i in seq(from=1, to = length(run_lengths))){
+      run_end <- sum(run_lengths[1:i])
+      if (i==1){run_start =1 }
+      else{
+        run_start <- sum(run_lengths[1:(i-1)]) +1
+      }
+      # print(t_col[run_start:run_end])
+      if (max_t %in% t_col[run_start:run_end]){ # if the run contains the ending time point of the cell of interest (max_t)
+        t_run <- t_col[run_end] - t_col[run_start]
+        t_start <- t_col[run_start]
+        t_neg_deriv <- t_col[which(tcf1_deriv[run_start:run_end] < 0)]
+        t_neg_deriv_cum <- last(t_neg_deriv) - first(t_neg_deriv)
+      }
+    }
+    return(list(t_run, t_start, t_neg_deriv_cum))
+  }
+  
+    
+
+# Determine the duration and starting time of the ending state of a cell
+  end_state_sum <- end_state_sum %>% rowwise() %>% mutate(end_state_dur = state_duration(df_pred, ID, max_t)[1], 
+                                                          end_state_start = state_duration(df_pred, ID, max_t)[2], 
+                                                          end_state_neg_deriv_cum = state_duration(df_pred, ID, max_t)[3])
+  end_state_sum$end_state_dur <-unlist(end_state_sum$end_state_dur)
+  end_state_sum$end_state_start <-unlist(end_state_sum$end_state_start)
+  
+  end_state_sum <- end_state_sum %>% ungroup()
+  
+  # end_state_sum contains multipe rows for each unique position and track number corresponding to the different longtracks that contain it
+  # now, select which longtrack info to use for state determination by selecting the longtrack where the state has the earliest start time 
+  # there may be multiple longtracks with same earliest start time; take the first one  
+  end_state_sum_single <- end_state_sum %>% group_by(pos, tr_num) %>% filter(longtrack == longtrack[which(end_state_start == min(end_state_start))][1])
+  
+   # add columns to end_state_sum_single with activity state at end of cell cycle, duration, and start time for child 1 and child 2
+  assign_child_end_state <- function(df_end_states, child_col, pos_col){
+    # print(child_col)
+    if (child_col != 0){
+      df_end_states <- df_end_states %>% filter(pos == pos_col)
+      if (child_col %in% df_end_states$tr_num){
+        child_end_state <- df_end_states[which(df_end_states['tr_num'] == as.numeric(child_col)),]$end_state
+        child_end_state_dur <- df_end_states[which(df_end_states['tr_num'] == as.numeric(child_col)),]$end_state_dur
+        child_end_state_start <- df_end_states[which(df_end_states['tr_num'] == as.numeric(child_col)),]$end_state_start
+        child_cc_t <- df_end_states[which(df_end_states['tr_num'] == as.numeric(child_col)),]$total_t_cellcycle
+        child_ID <- df_end_states[which(df_end_states['tr_num'] == as.numeric(child_col)),]$ID
+      }
+      else{
+        # print('child ends immediately')
+        child_end_state <- NA
+        child_end_state_dur <- NA
+        child_end_state_start <- NA
+        child_cc_t <- NA
+        child_ID <- NA} # this is a case where a child ends immediately after assignment 
+    }
+    else{
+      # print('child col = 0')
+      child_end_state <- NA 
+      child_end_state_dur <- NA
+      child_end_state_start <- NA
+      child_cc_t <- NA
+      child_ID <- NA}
+    return(list(child_end_state, child_end_state_dur, child_end_state_start, child_cc_t, child_ID))
+  }
+  
+  # remove cells for which end state is 4 and the cumulative time in negative promoter state is > 5  
+  rem_rows <- which(end_state_sum_single$end_state == 4 & end_state_sum_single$end_state_neg_deriv_cum > 5)
+  end_state_sum_single <- end_state_sum_single[-rem_rows, ]
+  
+  
+  # save original end_state_sum_single, prior to adding additional child info rows
+  end_state_sum_single_original <- end_state_sum_single
+  # add child 1 info
+  end_state_sum_single <- end_state_sum_single %>% rowwise() %>% mutate(child_1_end_state = unlist(assign_child_end_state(end_state_sum_single_original, child_1, pos)[1]), child_1_end_state_dur = unlist(assign_child_end_state(end_state_sum_single_original, child_1, pos)[2]), child_1_end_state_start = unlist(assign_child_end_state(end_state_sum_single_original, child_1, pos)[3]), child_1_cellcycle = unlist(assign_child_end_state(end_state_sum_single_original, child_1, pos)[4]), child_1_ID = unlist(assign_child_end_state(end_state_sum_single_original, child_1, pos)[5]))
+  # add child 2 info
+  end_state_sum_single <- end_state_sum_single %>% rowwise() %>% mutate(child_2_end_state = unlist(assign_child_end_state(end_state_sum_single_original, child_2, pos)[1]), child_2_end_state_dur = unlist(assign_child_end_state(end_state_sum_single_original, child_2, pos)[2]), child_2_end_state_start = unlist(assign_child_end_state(end_state_sum_single_original, child_2, pos)[3]), child_2_cellcycle = unlist(assign_child_end_state(end_state_sum_single_original, child_2, pos)[4]), child_2_ID = unlist(assign_child_end_state(end_state_sum_single_original, child_2, pos)[5]))
+  
+  # now filter the rows in end_state_sum_single by criteria: cell cycle time threshold; state_duration threshold (for both parents and both children)
+  end_state_filt <- end_state_sum_single %>% filter(total_t_cellcycle >= t_cellcycle_thresh)
+  end_state_filt <- end_state_filt %>% filter(child_1_cellcycle >= t_cellcycle_thresh & child_2_cellcycle >= t_cellcycle_thresh)
+  
+  # filter by duration of end state
+  end_state_filt <- end_state_filt %>% filter(end_state_dur >= state_dur_thresh)
+  
+  
+  # return end state dataframe
+  return(end_state_filt)
+}
+  
+```
+
+# Parent - daughter implementation
+```{r}
+output_folder_sister <- '/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/5.Experiments_labwork/Analysis/20200129_CD8_KL_infl/R_output_figures_102721/sisters_filter_neg'
+
+pred_0IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_0IL12_102721_tcf1-m3_filtered")
+pred_1IL12 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/pred_1IL12_102721_tcf1-m3_filtered")
+# parameters
+t_cellcycle_thresh = 3
+state_dur_thresh = 10
+
+# combine dfs; add lin and longtrack columns
+df_pred <- rbind(pred_0IL12, pred_1IL12)
+lin_col <- sapply(strsplit(df_pred$lin_tr, "_"), `[`, 1)
+longtrack_col <- sapply(strsplit(df_pred$lin_tr, "_"), `[`, 2)
+df_pred <- df_pred %>% add_column(lin = as.numeric(lin_col), .after = "pos" )
+df_pred <- df_pred %>% add_column(longtrack = as.numeric(longtrack_col), .after = "lin" )
+
+# run 
+pc_states <- parent_daughter_relate(df_pred, t_cellcycle_thresh, state_dur_thresh)# parent child states
+
+# save pc_states
+saveRDS(pc_states, file.path(output_folder_sister, 'pc_states.RDS'))
+
+
+
+```
+
+```{r}
+pc_states_old <- readRDS('/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/5.Experiments_labwork/Analysis/20200129_CD8_KL_infl/R_output_figures_102721/sisters/pc_states.RDS')
+pc_states_new <- readRDS(file.path(output_folder_sister, 'pc_states.RDS'))
+
+```
+
+# Seperate division events into different dataframes for each category and count events
+```{r}
+ON_states <- c(3,4)
+OFF_states <- c(1,2)
+
+pc_states <- readRDS(file.path(output_folder_sister, 'pc_states.RDS'))
+
+# filter by gen
+pc_states <- pc_states %>% filter(gen == 5)
+gen <- '5'
+
+
+# silencing events
+ON.2xON <- pc_states %>% filter(end_state %in% ON_states & child_1_end_state %in% ON_states & child_2_end_state %in% ON_states)
+ON.2xOFF <- pc_states %>% filter(end_state %in% ON_states & child_1_end_state %in% OFF_states & child_2_end_state %in% OFF_states)
+ON.OFF_ON_1 <- pc_states %>% filter(end_state %in% ON_states & child_1_end_state %in% ON_states & child_2_end_state %in% OFF_states)
+ON.OFF_ON_2 <- pc_states %>% filter(end_state %in% ON_states & child_1_end_state %in% OFF_states & child_2_end_state %in% ON_states)
+ON.OFF_ON <- rbind(ON.OFF_ON_1, ON.OFF_ON_2 ) %>% ungroup()
+
+# activation events
+OFF.2xON <- pc_states %>% filter(end_state %in% OFF_states & child_1_end_state %in% ON_states & child_2_end_state %in% ON_states)
+OFF.2xOFF <- pc_states %>% filter(end_state %in% OFF_states & child_1_end_state %in% OFF_states & child_2_end_state %in% OFF_states)
+OFF.OFF_ON_1 <- pc_states %>% filter(end_state %in% OFF_states & child_1_end_state %in% ON_states & child_2_end_state %in% OFF_states)
+OFF.OFF_ON_2 <- pc_states %>% filter(end_state %in% OFF_states & child_1_end_state %in% OFF_states & child_2_end_state %in% ON_states)
+OFF.OFF_ON <- rbind(ON.OFF_ON_1, ON.OFF_ON_2 ) %>% ungroup()
+
+# count categories
+
+event_summary <- function(condition, ON.2xON, ON.2xOFF, ON.OFF_ON){
+  total <- sum( nrow(filter(ON.2xON, cond == condition)), nrow(filter(ON.2xOFF, cond == condition)), nrow(filter(ON.OFF_ON, cond == condition)))
+  summary <- data.frame("cond" = c(condition, condition, condition, condition, condition), "cat" = c("ON.2xON","ON.2xOFF", "ON.OFF_ON_1","ON.OFF_ON_2", "ON.OFF_ON" ), "count" = c(nrow(filter(ON.2xON, cond == condition)), nrow(filter(ON.2xOFF, cond == condition)), nrow(filter(ON.OFF_ON_1, cond == condition)), nrow(filter(ON.OFF_ON_2, cond == condition)), nrow(filter(ON.OFF_ON, cond == condition))) )
+  summary$frac <- summary$count/total
+  summary$cat <- factor(summary$cat, levels = c("ON.2xON","ON.OFF_ON", "ON.OFF_ON_1","ON.OFF_ON_2", "ON.2xOFF" ))
+  return(summary)
+}
+
+
+summary_0IL12 <- event_summary('0IL12', ON.2xON, ON.2xOFF, ON.OFF_ON)
+summary_1IL12 <- event_summary('1IL12', ON.2xON, ON.2xOFF, ON.OFF_ON)
+
+summary <- rbind(summary_0IL12, summary_1IL12) 
+
+# Functions to plot silencing events and generate summary dfs
+# tcf1 silencing
+plot_events <- function(summary_df, gg_theme, output_folder, gen){
+  # convert condition to factor
+  summary_df <- summary_df %>% mutate(cond = factor(cond, levels = c("1IL12", "0IL12")))
+  # counts plot
+  g1 <- ggplot(data=summary_df, aes(x=cat, y= count, fill=cond)) + geom_col(state="identity", width=.5, position="dodge") + 
+    geom_text(aes(label=count), position=position_dodge(width=0.5), vjust=-0.25) +ylim(c(0,NA)) + xlab("") + ylab("Count") + 
+    gg_theme
+  # fraction plot
+  g2 <- ggplot(data=summary_df, aes(x=cat, y= frac, fill=cond)) + geom_col(state="identity", width=.5, position="dodge") + 
+    geom_text(aes(label=round(frac,2)), position=position_dodge(width=0.5), vjust=-0.25)  +ylim(c(0,1)) + xlab("") + ylab("Fraction") +gg_theme
+  g1
+  g2
+  save_plot(g1, filename = file.path(output_folder_sister, paste("sister_ON-OFF_counts_", gen, ".pdf", sep="")), base_asp = 1)
+  save_plot(g2, filename = file.path(output_folder_sister, paste("sister_ON-OFF_frac_", gen, ".pdf", sep="")), base_asp = 1)
+  return(list(g1,g2))
+} 
+
+
+# summary$gen <- 'all'
+# summary_all <- summary
+
+# summary$gen <- '1'
+# summary_gen1 <- summary
+
+# summary$gen <- '2'
+# summary_gen2 <- summary
+
+# summary$gen <- '3'
+# summary_gen3 <- summary
+
+# summary$gen <- '4'
+# summary_gen4 <- summary
+
+
+summary$gen <- '5'
+summary_gen5 <- summary
+
+plot_events(summary, gg_theme, output_folder_sister, gen )
+
+
+```
+
+
+# Function to visualize tracks from divisions categorized as ON-ON, ON-OFF, or OFF-OFF from each row of divtime df
+```{r}
+# plot_longtracks_pairs <- function(df, position, child_1, child_2, divtime_highlight, state_colors, theme, t_lim=100){
+# plot_longtracks_pairs <- function(x, df, state_colors, theme, t_lim=100){
+plot_longtracks_pairs <- function(pos, child_1, child_2, child_1_ID, child_2_ID, t, df, state_colors, theme, colors, subfolder, t_lim=100){
+  
+  normalize <- function(x) {
+    return ((x - min(x)) / (max(x) - min(x)))
+  }
+  
+  # extract values from x (where is is row input to function)
+  position = pos
+  divtime_highlight = t
+  
+  # limit x axis to time subset below and above division time (4/11)
+  t_lim_low <- divtime_highlight - 5
+  t_lim_high <- divtime_highlight + 15
+
+  
+  # first subset 
+  pred <- df %>% filter(pos == position)
+  pred <- pred %>% filter(ID == child_1_ID | ID == child_2_ID)
+  
+  # with normalization
+  pred$tcf1.smooth.norm <- normalize(pred$tcf1.smooth)
+  
+  # pull out each child track individually
+  pred_c1 <- pred %>% filter(ID == child_1_ID) %>% arrange(t)
+  # tmax_c1 <- max(pred_c1[which(pred_c1$tr_num == child_1), ]$t)
+  # pred_c1 <- pred_c1 %>% filter(t <= tmax_c1)
+  pred_c2 <- pred %>% filter(ID == child_2_ID) %>% arrange(t)
+  # tmax_c2 <- max(pred_c2[which(pred_c2$tr_num == child_2), ]$t)
+  # pred_c2 <- pred_c2 %>% filter(t <= tmax_c2)
+  
+  
+  pred_c1_sub <- filter(pred_c1, t >= t_lim_low & t <= t_lim_high)
+  pred_c2_sub <- filter(pred_c2, t >= t_lim_low & t <= t_lim_high)
+  
+  # limit y axis around min and max (4/11)
+  y_lim_low <- (min(c(pred_c1_sub$tcf1.smooth, pred_c2_sub$tcf1.smooth)) - 500000)/1000000
+  y_lim_high <-  (max(c(pred_c1_sub$tcf1.smooth, pred_c2_sub$tcf1.smooth)) + 500000)/1000000
+  
+  p <- ggplot() +
+    geom_line(data = pred_c1, aes(x = t, y = tcf1.smooth/1000000, color = factor(tcf1_fit_filtered), group = pos), alpha = 1, size = 1.2) +
+    geom_line(data = pred_c2, aes(x = t, y = tcf1.smooth/1000000, color = factor(tcf1_fit_filtered), group = pos), alpha = 1, size = 1.2) +
+          scale_color_manual(name = "tcf1_fit_filtered", values = colors) +
+    geom_vline(xintercept = pred_c1[which(pred_c1$divtimes == TRUE & pred_c1$t == divtime_highlight), ]$t, linetype = "dashed", color = "grey45") +
+    # comment out for presentation 04/11
+    # geom_point(data = pred_c1[which(pred_c1$divtimes == TRUE), ], aes(x= t, y = tcf1.smooth, color = factor(tcf1_fit_filtered)), alpha = 1, size = 3.5) +
+    # geom_point(data = pred_c2[which(pred_c2$divtimes == TRUE), ], aes(x= t, y = tcf1.smooth, color = factor(tcf1_fit_filtered)), alpha = 1, size = 3.5) +
+    xlim(t_lim_low,t_lim_high) +
+    # xlim(0,100) + 
+    ylim(y_lim_low, y_lim_high) +
+    # ylim(0,6000000) +
+    #if normalizing, use ylim(0,1)
+    # ylim(0,1) + 
+    labs(x = "Time (hrs)", y = expression(Intensity~(x ~10^{"6"}~a.u.))) + 
+    ggtitle(paste(pred_c1$ID, pred_c2$ID, sep = ", ")) +
+    theme 
+  print(p)
+  
+  save_plot(p, filename = file.path(output_folder_sister, paste(subfolder, child_1_ID, "_", child_2_ID, ".pdf", sep="")), base_height = 4, base_asp = 1)
+  
+  return(t)
+}
+```
+
+
+```{r}
+# call visualization function on each subset of division events 
+
+# plotting and saving info
+gg_theme <- theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_rect(fill = "transparent",colour = NA), plot.background = element_rect(fill = "transparent",colour = NA), axis.line = element_line(colour = "black"), text=element_text(size=16), legend.title=element_blank(), legend.position = "none")
+
+state_colors = c("1" = "#000004FF", # viridis::inferno 5 color
+                                    "2" = "#56106EFF",
+                                    "3" = "#BB3754FF",
+                                  "4" = "#F98C0AFF")
+on_off_colors = c("1" = "#56106EFF", 
+                                    "2" = "#56106EFF",
+                                    "3" = "#F98C0AFF",
+                                  "4" = "#F98C0AFF")
+
+
+# ON.2x_OFF
+ON.2xOFF$t <-ON.2xOFF$max_t
+test <- ON.2xOFF %>% dplyr::select(pos, child_1, child_2, child_1_ID, child_2_ID, t) %>%  pmap_chr(plot_longtracks_pairs, df_pred, state_colors=state_colors, theme = gg_theme, colors = state_colors, subfolder= "p2/", t_lim=100)
+```
+
+```{r}
+# ON.OFF_ON
+ON.OFF_ON$t <-ON.OFF_ON$max_t
+test <- ON.OFF_ON %>% dplyr::select(pos, child_1, child_2, child_1_ID, child_2_ID, t) %>%  pmap_chr(plot_longtracks_pairs, df=rbind(pred_0IL12, pred_1IL12), state_colors=state_colors, theme = gg_theme, colors = state_colors, subfolder= "p1/",t_lim=100)
+```
+
+```{r}
+# ON.2xON
+ON.2xON$t <-ON.2xON$max_t
+test <- ON.2xON %>% dplyr::select(pos, child_1, child_2, child_1_ID, child_2_ID, t) %>%  pmap_chr(plot_longtracks_pairs, df=rbind(pred_0IL12, pred_1IL12), state_colors=state_colors, theme = gg_theme, colors = state_colors, subfolder= "p0/", t_lim=100)
+
+```
+
+
+# Plot p1 and p2 for daughter silencing on stochastic / asymmetric prediction 2D plot
+```{r}
+plot_probabilities <- function(df_event){
+  cond_colors <- c("black","#00BFC4")
+  # first define the curves where probabilities are independent
+  p2 = seq(from=0, to= 1, by=.001)
+  p1_ind = 2*sqrt(p2)*(1-sqrt(p2))
+  p1_max = 1 - p2;
+  df_theo <- tibble('p1_ind' = p1_ind, 'p2' = p2, 'p1_max' = p1_max)
+  df_theo <- df_theo %>% melt(id.vars = c('p2'), measure.vars = c('p1_ind', 'p1_max'))
+  
+  # get points from quantified silencing events 
+  df_prob <- df_event %>% group_by(gen, cond) %>% summarise(p1 = frac[which(cat == 'ON.OFF_ON')], p2 = frac[which(cat == 'ON.2xOFF')] ) %>% ungroup()
+  
+  # filter to show only one condition, if desired
+  df_prob <- df_prob %>% 
+    # filter(cond == '1IL12') %>%
+    # set condition levels
+    mutate(cond = factor(cond, levels = c("1IL12", "0IL12")))
+  
+  p <- ggplot() +
+    geom_path(data = df_theo, aes(x=value, y= p2), size = 1) + 
+    geom_point(data = df_prob, aes(x = p1, y = p2, color = cond, shape = factor(gen, levels = c('1', '2', '3', '4', 'all'))), size = 4) +
+    scale_color_manual("", values = cond_colors) +
+    scale_x_continuous(limits = c(0,1), expand = c(0, 0)) +
+    scale_y_continuous(limits = c(0,1), expand = c(0, 0)) +
+     xlab("p1") + ylab("p2") + coord_fixed() +gg_theme
+  p
+  save_plot(p, filename = file.path(output_folder_sister, "20211028_silencing summary_comb_gen1-4.pdf"))
+}
+
+# summary_comb <- rbind(summary_all, summary_gen1, summary_gen2, summary_gen3, summary_gen4)
+# 
+# plot_probabilities(summary_comb)
+# 
+# saveRDS(summary_comb, file.path(output_folder_sister, "20211028_silencing summary_comb_gen1-4.RDS") )
+
+
+# Run on previously saved summary df
+summary_comb <- readRDS(file.path(output_folder_sister, "20211028_silencing summary_comb_gen1-4.RDS"))
+plot_probabilities(summary_comb)
+
+# save csv
+write.csv(summary_comb, file = file.path(output_folder_sister, "20211028_silencing summary_comb_table.csv"))
+```
+
+# plot kappa test results, imported from excel 
+```{r}
+
+gg_theme_kappa <- theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), plot.background = element_blank(),axis.line = element_line(colour = "black"), legend.position = "none", axis.text = element_text(size = 18), text=element_text(size=32), axis.title = element_blank()) 
+
+# import excel file
+kappa <- read_excel(file.path(output_folder_sister, "disagreement_score_statistical_calculations_tailed_KA.xlsx"))
+
+# set columns as factors
+kappa$gen <- factor(kappa$gen, levels = c('all', '1', '2', '3', '4'))
+kappa$cond <- factor(kappa$cond, levels = c('1IL12', '0IL12')) 
+
+# plot 
+g_kappa <- kappa %>% 
+  ggplot(aes(x= gen, y = k, ymin = low_bound, ymax = high_bound, fill = cond)) +
+  geom_col(position=position_dodge(width=0.9), stat="identity") +
+  geom_errorbar(position=position_dodge(width=0.9), width=0.2) +
+  geom_hline(yintercept=1, linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept=0, linetype = "dashed", color = "gray50") +
+  scale_fill_manual("", values = cond_colors) +
+  ylim(-0.4,1.1) +
+  gg_theme_kappa
+  
+save_plot(g_kappa, filename = file.path(output_folder_sister, "kappa_summary.pdf"), base_asp = 1.2)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+      
