@@ -1,0 +1,70 @@
+TCF1 HMMs
+
+
+Model 1 in supplemental figure ** this is the model selected for analysis
+Description:
+- 4 state
+- relaxed OFF state constraint compared to Model 2
+Run notes:
+- control = list(fnscale = 50000)
+- exact times = FALSE
+MSM input:
+#6/24 - 4 states
+# TCF1
+# 4 state (linear):
+num_states <- 4
+data_channel <- "tcf1"
+qmatrix_init <- rbind(c(0, 0, .01, .01), c(0, 0, .01, .01), c(0, .01, 0, .01), c(0, .01, .01, 0)) # transitions
+state_params <- rbind(c(-8000,13000), c(10000,13000), c(30000,22000), c(60000,17830)) # rows are states, columns are mu and sigma
+ranges <- list(mean = list(lower=c(-20000,0,20000,50000), upper=c(-3000,15000,35000,120000)))
+
+
+Model 2 in supplemental figure
+Description:
+- 4 state
+- OFF states converge on edge of constraints
+Run notes:
+- control = list(fnscale = 50000)
+- exact times = FALSE
+MSM input:
+#6/24 - 4 states
+# TCF1
+# 4 state (linear):
+num_states <- 4
+data_channel <- "tcf1"
+qmatrix_init <- rbind(c(0, 0, .01, .01), c(0, 0, .01, .01), c(0, .01, 0, .01), c(0, .01, .01, 0)) # transitions
+state_params <- rbind(c(-8000,13000), c(10000,13000), c(30000,22000), c(60000,17830)) # rows are states, columns are mu and sigma
+ranges <- list(mean = list(lower=c(-12000,8000,20000,50000), upper=c(-3000,15000,35000,120000)))
+
+
+Model 3 in supplemental figure - does not converge
+Description:
+- 3 state
+Run notes:
+- control = list(fnscale = 50000)
+- exact times = FALSE
+MSM input:
+#6/24 - 3 states
+# TCF1
+# 3 state (linear):
+num_states <- 3
+data_channel <- "tcf1"
+qmatrix_init <- rbind(c(0, .01, .01), c(0, 0, .01), c(0, .01, 0)) # transitions
+state_params <- rbind(c(-8000,13000), c(10000,13000), c(40000,22000)) # rows are states, columns are mu and sigma
+ranges <- list(mean = list(lower=c(-12000,8000,20000), upper=c(-3000,15000,120000)))
+
+Model 4 in supplemental figure
+Description:
+- 3 state
+- OFF state mean constraints relaxed compared to Model 4
+Run notes:
+- control = list(fnsca
+MSM input:
+#6/24 - 3 states
+# TCF1
+# 3 state (linear):
+num_states <- 3
+data_channel <- "tcf1"
+qmatrix_init <- rbind(c(0, .01, .01), c(0, 0, .01), c(0, .01, 0)) # transitions
+state_params <- rbind(c(-8000,13000), c(10000,13000), c(40000,22000)) # rows are states, columns are mu and sigma
+ranges <- list(mean = list(lower=c(-20000,0,20000), upper=c(-3000,15000,120000)))
