@@ -299,11 +299,12 @@ Note that folder containing files must end in "_" followed by the experimental c
 field_names_fluor <- c("t", "area", "tbet", "tcf1", "cd69", "tbet.smooth", "tbet.deriv", "tcf1.smooth", "tcf1.deriv") 
 field_names_trs <- c("tr", "gen", "edata", "children")
 
+# path with .mat input files exported from matlab
 path <- "~/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/Matlab_Imaging_Transfer/20200129_CD8_KL_infl/R_input_102721"
 pattern <- "trlong.mat"
 pattern_trs <- "trlong_trs.mat"
 
-# Main folder
+# main folder for saving analyses
 manuscript_folder <- "/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/manuscript_2023"
 
 ```
@@ -495,13 +496,6 @@ control = list(fnscale = 50000) )
 
 #save fits (msm object) with model number - using manuscript updated model numbers 
 saveRDS(fit, file = file.path(manuscript_folder, "Tcf1_manuscript_model1_102721"))
-
-# compare 102721 fits
-fit_manuscript_m1 <- readRDS(file.path(manuscript_folder, "Tcf1_manuscript_model1_102721"))
-
-
-# fit_m3 <- readRDS("/Users/kathleenabadie/Google Drive/1.Lab_starting_March_2018/6.Image_analysis/HMM_promoter_states/Tcf1_model3_102721")
-
 
 ```
 
