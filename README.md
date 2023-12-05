@@ -15,7 +15,7 @@ calc_YFP_fractions.m, plot_time_YFP_hist_1D.m, time_YFP_hist.m are used to conve
 
 ## image_analysis_downstream_R
 These scripts are related to Figure 3 and Figure S3.
-HMM_promoter_states_analysis_manuscript.Rmd implements a hidden markov model to call Tcf7 promoter states from the live imaging data. 
+HMM_promoter_states_analysis_manuscript.Rmd implements a hidden markov model to call Tcf7 promoter states from the live imaging data and generate subsequent Tcf7 silencing analyses (R).
 
 ## hom_het_analysis
 
