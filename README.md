@@ -1,5 +1,5 @@
 # Tcellmemory_Abadie-et-al-2024
-This repository includes code for analysis of genomics, imaging, and flow cytometry datasets for Abadie et al., 2024, " Reversible, tunable epigenetic silencing of TCF1 generates flexibility in the T cell memory decision." These scripts are minimally commented to be functional and reproducible, but they are not tutorials. Please see the Methods section in the manuscript for additional details. 
+This repository includes code for analysis of genomics, imaging, and flow cytometry datasets for Abadie et al., 2024, " Reversible, tunable epigenetic silencing of TCF1 generates flexibility in the T cell memory decision." These scripts are shared for transparency and are minimally commented to be functional and reproducible, but they do not constitute streamlined pipelines. Please see the Methods section in the manuscript for additional details. 
 
 ### scifate_analysis
 This scripts are related to Figure 2 and Figure S2.  
@@ -10,7 +10,7 @@ Dynamo_Tcell_newRNA_Tcell_workflow.ipynb contains RNA velocity analyses using Dy
 ### image_analysis_matlab
 These scripts are related to Figure 3 and Figure S3, as well as Figure 4E-F.   
 2022_ictrack_general_public.tar.gz contains scripts for image pre-processing, cell segmentation, and cell tracking. The ictrack software is adapted from Kueh et al., Nature Immunology, 2016 and Ng et al., eLife, 2018.  
-2022_longtracks_general_public.tar.gz contains scripts used to generate YFP intensity tracks over time that are used as imput to image_analysis_downstream_R analyses.  
+2022_longtracks_general_public.tar.gz contains scripts used to generate cell tracks over time (containing YFP intensity, CD69 intensity, area, etc.) that are used as input to image_analysis_downstream_R analyses.  
 calc_YFP_fractions.m, plot_time_YFP_hist_1D.m, time_YFP_hist.m are used to convert time-lapse imaging output to YFP histograms and YFP+ fraction line plots in Figure 4E-F.  
 
 ### image_analysis_downstream_R
@@ -24,7 +24,8 @@ These scripts are related to Figure 3I-J and Figure S3L.
 
 
 ### bulk_genomics_analysis
-
+These scripts are related to Figure 4 and Figure S4.  
+Tcf7_RNA_DESeq2.ipynb and Tcf7_ATAC_HOMER_output.ipynb use DESeq2 to perform differential expression and differential peak accessibility analysis on the bulk RNA-seq and bulk ATAC-seq datasets, respectively (R).   
 
 ### modeling_simulations_matlab
 These scripts are related to Figure 7 and Figure S7.  
